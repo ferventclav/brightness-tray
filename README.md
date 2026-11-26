@@ -6,6 +6,21 @@ Built as a standalone replacement for the PowerToys brightness flyout with zero 
 
 ![Brightness Tray flyout preview](docs/preview.png)
 
+## Context Menu & Controls
+
+Open the Fluent 2 Acrylic menu by **right-clicking** the tray icon or clicking the **Settings** gear in the flyout:
+
+| Tray Right-Click Menu | Flyout Settings Menu |
+| :---: | :---: |
+| ![Tray context menu](docs/menu-tray.png) | ![Flyout settings menu](docs/menu-flyout.png) |
+
+- **Match room light (Auto):** Takes a one-shot ambient light reading (using a hardware `LightSensor` if available, or your webcam in read-only mode) and smoothly adjusts all displays. Automatically hidden on PCs with neither a light sensor nor a webcam.
+- **Auto-adjust on wake:** Runs a one-shot room-light adjustment after waking from sleep or opening the laptop lid.
+- **Link monitors:** Keeps brightness deltas synchronized across all connected displays when you drag any slider.
+- **Run at Windows startup:** Registers the app to start automatically when you log in to Windows.
+- **Refresh monitors:** Re-scans connected internal and external `DDC/CI` displays.
+- **Exit:** Closes `brightness-tray` cleanly.
+
 ## Quick Start
 
 1. **Download:** Grab `brightness-tray.exe` from the [latest GitHub Release](https://github.com/ferventclav/brightness-tray/releases/latest) and place it anywhere you like (e.g. `C:\Tools\brightness-tray.exe`).
