@@ -2,6 +2,7 @@
 
 mod ambient;
 mod camera;
+mod menu;
 mod monitors;
 mod startup;
 mod theme;
@@ -44,19 +45,17 @@ use windows::Win32::UI::Shell::{
     NIM_SETVERSION, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
-    DestroyIcon, DestroyMenu, DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics,
-    KillTimer, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW,
-    RegisterWindowMessageW, SetCursor, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow,
-    TrackPopupMenu, TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, HICON,
-    HWND_TOPMOST, ICONINFO, IDC_ARROW, IDC_HAND, MF_CHECKED, MF_SEPARATOR, MF_STRING,
-    MF_UNCHECKED, MSG, SM_CXSMICON, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, TPM_BOTTOMALIGN,
-    TPM_LEFTALIGN, TPM_RIGHTBUTTON, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_COMMAND, WM_CREATE,
-    WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_NULL, WM_PAINT, WM_POWERBROADCAST, WM_RBUTTONUP, WM_SETCURSOR,
-    WM_SETTINGCHANGE, WM_TIMER, DEVICE_NOTIFY_WINDOW_HANDLE, PBT_APMRESUMEAUTOMATIC,
-    PBT_APMRESUMESUSPEND, PBT_POWERSETTINGCHANGE, WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyIcon, DispatchMessageW,
+    GetCursorPos, GetMessageW, GetSystemMetrics, KillTimer, LoadCursorW, PostMessageW,
+    PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetCursor, SetForegroundWindow,
+    SetTimer, SetWindowPos, ShowWindow, TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
+    HICON, HWND_TOPMOST, ICONINFO, IDC_ARROW, IDC_HAND, MSG, SM_CXSMICON, SWP_NOACTIVATE,
+    SWP_SHOWWINDOW, SW_HIDE, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_COMMAND, WM_CREATE, WM_DESTROY,
+    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_PAINT, WM_POWERBROADCAST, WM_RBUTTONUP, WM_SETCURSOR, WM_SETTINGCHANGE, WM_TIMER,
+    DEVICE_NOTIFY_WINDOW_HANDLE, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND,
+    PBT_POWERSETTINGCHANGE, WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP,
 };
 
 use ambient::AmbientCapability;
@@ -291,45 +290,59 @@ impl AppState {
     }
 
     fn show_context_menu(&mut self) {
+        let mut entries = Vec::new();
+        if self.ambient_cap != AmbientCapability::None {
+            entries.push(menu::MenuEntry::Item {
+                id: CMD_MEASURE_AMBIENT,
+                label: "Match room light (Auto)".to_string(),
+                glyph: 0xE706, // Brightness
+                checked: None,
+            });
+            entries.push(menu::MenuEntry::Item {
+                id: CMD_TOGGLE_WAKE_AUTO,
+                label: "Auto-adjust on wake".to_string(),
+                glyph: 0xE7E8, // Power / wake
+                checked: Some(self.auto_on_wake),
+            });
+        }
+        entries.push(menu::MenuEntry::Item {
+            id: CMD_TOGGLE_LINK,
+            label: "Link monitors".to_string(),
+            glyph: 0xE71B, // Link
+            checked: Some(self.linked),
+        });
+        entries.push(menu::MenuEntry::Item {
+            id: CMD_TOGGLE_STARTUP,
+            label: "Run at Windows startup".to_string(),
+            glyph: 0xE770, // System / startup
+            checked: Some(startup::is_startup_enabled()),
+        });
+        entries.push(menu::MenuEntry::Item {
+            id: CMD_REFRESH,
+            label: "Refresh monitors".to_string(),
+            glyph: 0xE72C, // Refresh
+            checked: None,
+        });
+        entries.push(menu::MenuEntry::Separator);
+        entries.push(menu::MenuEntry::Item {
+            id: CMD_EXIT,
+            label: "Exit".to_string(),
+            glyph: 0xE711, // Cancel / Exit
+            checked: None,
+        });
+
+        let mut pt = windows::Win32::Foundation::POINT::default();
         unsafe {
-            let Ok(menu) = CreatePopupMenu() else {
-                return;
-            };
-            let startup_flags = MF_STRING
-                | if startup::is_startup_enabled() {
-                    MF_CHECKED
-                } else {
-                    MF_UNCHECKED
-                };
-            let link_flags = MF_STRING | if self.linked { MF_CHECKED } else { MF_UNCHECKED };
-            let wake_flags = MF_STRING | if self.auto_on_wake { MF_CHECKED } else { MF_UNCHECKED };
-
-            if self.ambient_cap != AmbientCapability::None {
-                let _ = AppendMenuW(menu, MF_STRING, CMD_MEASURE_AMBIENT, w!("Match room light (Auto)"));
-                let _ = AppendMenuW(menu, wake_flags, CMD_TOGGLE_WAKE_AUTO, w!("Auto-adjust on wake / lid open"));
-            }
-            let _ = AppendMenuW(menu, link_flags, CMD_TOGGLE_LINK, w!("Link monitors"));
-            let _ = AppendMenuW(menu, startup_flags, CMD_TOGGLE_STARTUP, w!("Run at Windows startup"));
-            let _ = AppendMenuW(menu, MF_STRING, CMD_REFRESH, w!("Refresh monitors"));
-            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-            let _ = AppendMenuW(menu, MF_STRING, CMD_EXIT, w!("Exit"));
-
-            let mut pt = windows::Win32::Foundation::POINT::default();
             let _ = GetCursorPos(&mut pt);
-            self.menu_open = true;
-            let _ = SetForegroundWindow(self.hwnd);
-            let _ = TrackPopupMenu(
-                menu,
-                TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_LEFTALIGN,
-                pt.x,
-                pt.y,
-                0,
-                self.hwnd,
-                None,
-            );
-            let _ = PostMessageW(self.hwnd, WM_NULL, WPARAM(0), LPARAM(0));
-            self.menu_open = false;
-            let _ = DestroyMenu(menu);
+        }
+        self.menu_open = true;
+        let selected = menu::show_fluent_menu(self.hwnd, pt, ThemeColors::load(), entries);
+        self.menu_open = false;
+
+        if let Some(cmd_id) = selected {
+            unsafe {
+                let _ = PostMessageW(self.hwnd, WM_COMMAND, WPARAM(cmd_id), LPARAM(0));
+            }
         }
     }
 }

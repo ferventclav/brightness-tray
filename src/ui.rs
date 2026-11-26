@@ -250,8 +250,8 @@ pub fn apply_win11_backdrop(hwnd: HWND, is_dark: bool) {
                 windows::core::s!("SetWindowCompositionAttribute"),
             ) {
                 let func: SetWindowCompositionAttributeFn = std::mem::transmute(proc);
-                // AABBGGRR: ~65% dark charcoal in dark mode, ~80% soft white in light mode
-                let gradient_color = if is_dark { 0xA61C1C1C } else { 0xCCF2F2F2 };
+                // AABBGGRR: ~60% dark charcoal in dark mode, ~80% soft white in light mode
+                let gradient_color = if is_dark { 0x99202020 } else { 0xCCF2F2F2 };
                 let mut policy = AccentPolicy {
                     accent_state: 4, // ACCENT_ENABLE_ACRYLICBLURBEHIND
                     accent_flags: 2,
