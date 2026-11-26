@@ -47,9 +47,9 @@ use crate::ui::apply_win11_backdrop;
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const MENU_WIDTH_DIP: f32 = 256.0;
-const MENU_PAD: f32 = 4.0;
-const ITEM_HEIGHT: f32 = 32.0;
-const SEP_HEIGHT: f32 = 7.0;
+const MENU_PAD: f32 = 2.0;
+const ITEM_HEIGHT: f32 = 37.0;
+const SEP_HEIGHT: f32 = 1.0;
 
 #[derive(Clone)]
 pub enum MenuEntry {
@@ -147,7 +147,7 @@ impl MenuState {
                 let _ = ctx.EndDraw(None, None);
                 return;
             };
-            let Ok(brush_accent) = rt.CreateSolidColorBrush(&self.theme.accent, None) else {
+            let Ok(_brush_accent) = rt.CreateSolidColorBrush(&self.theme.accent, None) else {
                 let _ = ctx.EndDraw(None, None);
                 return;
             };
@@ -155,12 +155,19 @@ impl MenuState {
                 let _ = ctx.EndDraw(None, None);
                 return;
             };
-            let Ok(brush_border) = rt.CreateSolidColorBrush(&self.theme.window_border, None) else {
+            let border_color = D2D1_COLOR_F {
+                r: self.theme.window_border.r,
+                g: self.theme.window_border.g,
+                b: self.theme.window_border.b,
+                a: 0.045,
+            };
+            let Ok(brush_border) = rt.CreateSolidColorBrush(&border_color, None) else {
                 let _ = ctx.EndDraw(None, None);
                 return;
             };
 
             let mut y = MENU_PAD;
+            let total_entries = self.entries.len();
             for (i, entry) in self.entries.iter().enumerate() {
                 match entry {
                     MenuEntry::Item { label, glyph, checked, .. } => {
@@ -181,15 +188,15 @@ impl MenuState {
                             );
                         }
 
-                        // Left icon (uniform crisp icon color matching Win11 native menus)
+                        // Left icon (16px Fluent icon)
                         let icon_glyph = [*glyph];
                         ctx.DrawText(
                             &icon_glyph,
                             &self.font_icon,
                             &D2D_RECT_F {
-                                left: r.left + 10.0,
+                                left: r.left + 12.0,
                                 top: r.top,
-                                right: r.left + 30.0,
+                                right: r.left + 32.0,
                                 bottom: r.bottom,
                             },
                             &brush_icon,
@@ -203,9 +210,9 @@ impl MenuState {
                             &label_w,
                             &self.font_text,
                             &D2D_RECT_F {
-                                left: r.left + 40.0,
+                                left: r.left + 44.0,
                                 top: r.top,
-                                right: r.right - 30.0,
+                                right: r.right - 28.0,
                                 bottom: r.bottom,
                             },
                             &brush_text,
@@ -220,7 +227,7 @@ impl MenuState {
                                 &chk,
                                 &self.font_check,
                                 &D2D_RECT_F {
-                                    left: r.right - 28.0,
+                                    left: r.right - 26.0,
                                     top: r.top,
                                     right: r.right - 10.0,
                                     bottom: r.bottom,
@@ -231,12 +238,21 @@ impl MenuState {
                             );
                         }
                         y += ITEM_HEIGHT;
+                        // Subtle 1px divider between rows (matching Win11 Network/Sound menus)
+                        if i + 1 < total_entries && !matches!(self.entries[i + 1], MenuEntry::Separator) {
+                            ctx.DrawLine(
+                                D2D_POINT_2F { x: 0.0, y },
+                                D2D_POINT_2F { x: MENU_WIDTH_DIP, y },
+                                &brush_div,
+                                1.0,
+                                None,
+                            );
+                        }
                     }
                     MenuEntry::Separator => {
-                        let line_y = y + SEP_HEIGHT / 2.0;
                         ctx.DrawLine(
-                            D2D_POINT_2F { x: 0.0, y: line_y },
-                            D2D_POINT_2F { x: MENU_WIDTH_DIP, y: line_y },
+                            D2D_POINT_2F { x: 0.0, y },
+                            D2D_POINT_2F { x: MENU_WIDTH_DIP, y },
                             &brush_div,
                             1.0,
                             None,
@@ -434,7 +450,7 @@ pub fn show_fluent_menu(
                 DWRITE_FONT_WEIGHT_REGULAR,
                 DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_STRETCH_NORMAL,
-                14.5,
+                16.0,
                 w!("en-US"),
             )
             .ok()?;
