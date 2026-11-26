@@ -34,6 +34,7 @@ windows = { version = "0.58", features = [
     "Win32_Media_MediaFoundation",
     "Win32_Media_DirectShow",
     "Win32_Security",
+    "Devices_Sensors",
 ] }
 
 [profile.release]

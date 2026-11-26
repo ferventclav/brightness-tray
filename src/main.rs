@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+mod ambient;
 mod camera;
 mod monitors;
 mod startup;
@@ -58,6 +59,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
+use ambient::AmbientCapability;
 use monitors::{BackendKind, MonitorManager};
 use theme::ThemeColors;
 use ui::{
@@ -102,6 +104,7 @@ struct AppState {
     hover: HoverTarget,
     dragging_idx: Option<usize>,
     linked: bool,
+    ambient_cap: AmbientCapability,
     measuring_ambient: bool,
     auto_on_wake: bool,
     visible: bool,
@@ -138,12 +141,16 @@ impl AppState {
                 self.dragging_idx,
                 self.linked,
                 self.measuring_ambient,
+                self.ambient_cap != AmbientCapability::None,
                 self.dpi() as f32,
             );
         }
     }
 
     fn trigger_ambient_measure(&mut self) {
+        if self.ambient_cap == AmbientCapability::None {
+            return;
+        }
         if !self.measuring_ambient {
             self.measuring_ambient = true;
             let hwnd_raw = self.hwnd.0 as isize;
@@ -151,7 +158,7 @@ impl AppState {
                 let _ = SetTimer(self.hwnd, TIMER_AMBIENT_TIMEOUT, 3500, None);
             }
             std::thread::spawn(move || {
-                let measured = camera::measure_room_brightness().unwrap_or(u32::MAX);
+                let measured = ambient::measure_ambient_brightness().unwrap_or(u32::MAX);
                 unsafe {
                     let _ = PostMessageW(
                         HWND(hwnd_raw as *mut core::ffi::c_void),
@@ -297,8 +304,10 @@ impl AppState {
             let link_flags = MF_STRING | if self.linked { MF_CHECKED } else { MF_UNCHECKED };
             let wake_flags = MF_STRING | if self.auto_on_wake { MF_CHECKED } else { MF_UNCHECKED };
 
-            let _ = AppendMenuW(menu, MF_STRING, CMD_MEASURE_AMBIENT, w!("Match room light (Auto)"));
-            let _ = AppendMenuW(menu, wake_flags, CMD_TOGGLE_WAKE_AUTO, w!("Auto-adjust on wake / lid open"));
+            if self.ambient_cap != AmbientCapability::None {
+                let _ = AppendMenuW(menu, MF_STRING, CMD_MEASURE_AMBIENT, w!("Match room light (Auto)"));
+                let _ = AppendMenuW(menu, wake_flags, CMD_TOGGLE_WAKE_AUTO, w!("Auto-adjust on wake / lid open"));
+            }
             let _ = AppendMenuW(menu, link_flags, CMD_TOGGLE_LINK, w!("Link monitors"));
             let _ = AppendMenuW(menu, startup_flags, CMD_TOGGLE_STARTUP, w!("Run at Windows startup"));
             let _ = AppendMenuW(menu, MF_STRING, CMD_REFRESH, w!("Refresh monitors"));
@@ -371,6 +380,7 @@ fn main() {
             hover: HoverTarget::None,
             dragging_idx: None,
             linked: false,
+            ambient_cap: ambient::detect_capability(),
             measuring_ambient: false,
             auto_on_wake: read_auto_on_wake(),
             visible: false,
@@ -772,7 +782,8 @@ unsafe extern "system" fn wnd_proc(
                 state.set_monitor_brightness_f32(idx, b);
             } else {
                 let total_h = compute_flyout_height_dip(state.monitors.len());
-                let new_hover = hit_test(x, y, state.monitors.len(), total_h);
+                let show_auto = state.ambient_cap != AmbientCapability::None;
+                let new_hover = hit_test(x, y, state.monitors.len(), total_h, show_auto);
                 if new_hover != state.hover {
                     state.hover = new_hover;
                     state.render();
@@ -793,7 +804,8 @@ unsafe extern "system" fn wnd_proc(
             let x = ((lparam.0 & 0xFFFF) as i16) as f32 / scale;
             let y = (((lparam.0 >> 16) & 0xFFFF) as i16) as f32 / scale;
             let total_h = compute_flyout_height_dip(state.monitors.len());
-            let target = hit_test(x, y, state.monitors.len(), total_h);
+            let show_auto = state.ambient_cap != AmbientCapability::None;
+            let target = hit_test(x, y, state.monitors.len(), total_h, show_auto);
 
             match target {
                 HoverTarget::Slider(idx) => {

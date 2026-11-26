@@ -125,7 +125,7 @@ pub fn card_index_at(x: f32, y: f32, count: usize) -> Option<usize> {
     None
 }
 
-pub fn button_rects(total_height_dip: f32) -> [(HoverTarget, D2D_RECT_F); 4] {
+pub fn button_rects(total_height_dip: f32, show_auto: bool) -> Vec<(HoverTarget, D2D_RECT_F)> {
     let btn_w = 36.0;
     let btn_h = 30.0;
     let gap = 6.0;
@@ -157,16 +157,24 @@ pub fn button_rects(total_height_dip: f32) -> [(HoverTarget, D2D_RECT_F); 4] {
         bottom: top + btn_h,
     };
 
-    [
-        (HoverTarget::AutoButton, auto_rect),
-        (HoverTarget::LinkButton, link_rect),
-        (HoverTarget::RefreshButton, refresh_rect),
-        (HoverTarget::SettingsButton, settings_rect),
-    ]
+    let mut btns = Vec::with_capacity(4);
+    if show_auto {
+        btns.push((HoverTarget::AutoButton, auto_rect));
+    }
+    btns.push((HoverTarget::LinkButton, link_rect));
+    btns.push((HoverTarget::RefreshButton, refresh_rect));
+    btns.push((HoverTarget::SettingsButton, settings_rect));
+    btns
 }
 
-pub fn hit_test(x: f32, y: f32, monitor_count: usize, total_height_dip: f32) -> HoverTarget {
-    for (target, r) in button_rects(total_height_dip) {
+pub fn hit_test(
+    x: f32,
+    y: f32,
+    monitor_count: usize,
+    total_height_dip: f32,
+    show_auto: bool,
+) -> HoverTarget {
+    for (target, r) in button_rects(total_height_dip, show_auto) {
         if x >= r.left && x <= r.right && y >= r.top && y <= r.bottom {
             return target;
         }
@@ -406,6 +414,7 @@ impl Renderer {
         dragging_idx: Option<usize>,
         linked: bool,
         auto_brightness: bool,
+        show_auto: bool,
         dpi: f32,
     ) -> windows::core::Result<()> {
         let total_h = compute_flyout_height_dip(monitors.len());
@@ -604,7 +613,7 @@ impl Renderer {
             );
 
             // Toolbar buttons
-            for (target, r) in button_rects(total_h) {
+            for (target, r) in button_rects(total_h, show_auto) {
                 let is_hovered = hover == target;
                 let is_active_toggle = (target == HoverTarget::LinkButton && linked)
                     || (target == HoverTarget::AutoButton && auto_brightness);
@@ -929,14 +938,15 @@ mod tests {
         let (l, r, t, b) = slider_bounds_for_card(1);
         let mid_x = (l + r) / 2.0;
         let mid_y = (t + b) / 2.0;
-        assert_eq!(hit_test(mid_x, mid_y, 2, h2), HoverTarget::Slider(1));
+        assert_eq!(hit_test(mid_x, mid_y, 2, h2, true), HoverTarget::Slider(1));
         assert_eq!(card_index_at(mid_x, mid_y, 2), Some(1));
         assert_eq!(card_index_at(2.0, mid_y, 2), None);
 
-        for (expected, rect) in button_rects(h2) {
+        for (expected, rect) in button_rects(h2, true) {
             let bx = (rect.left + rect.right) / 2.0;
             let by = (rect.top + rect.bottom) / 2.0;
-            assert_eq!(hit_test(bx, by, 2, h2), expected);
+            assert_eq!(hit_test(bx, by, 2, h2, true), expected);
         }
+        assert_eq!(button_rects(h2, false).len(), 3);
     }
 }

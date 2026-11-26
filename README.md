@@ -10,7 +10,10 @@ Built as a standalone replacement for the PowerToys brightness flyout with zero 
 - **Windows 11 Acrylic flyout:** Direct3D 11 + DirectComposition + Direct2D UI that adapts to your Windows dark/light theme and accent color, with rounded corners and per-monitor DPI scaling.
 - **Smooth transitions:** Non-blocking background worker thread with preemptible `700ms` ease-in-out cubic hardware ramping and 60fps slider animation.
 - **Link monitors:** Toggle delta-synced brightness across all connected displays.
-- **On-demand room-light Auto-Brightness:** Samples your default webcam in read-only mode (skipping automatically if another app is using the camera) and maps room luminance using a Weber-Fechner perceptual curve.
+- **Adaptive Auto-Brightness (3-tier hardware fallback):**
+  1. Uses a dedicated hardware **Ambient Light Sensor** (`Windows.Devices.Sensors.LightSensor`) when available (zero camera usage).
+  2. Falls back to **on-demand webcam room-light sampling** (read-only, skips automatically if another app is using the camera) using a Weber-Fechner perceptual curve.
+  3. On desktops/laptops with neither an ALS nor a webcam, cleanly hides the **Auto** controls so only manual sliders, **Link**, **Refresh**, and **Settings** are shown.
 - **Optional wake/lid-open auto-adjust:** Off by default; enable from the tray/settings menu.
 - **Resilient tray icon:** Re-registers on `TaskbarCreated` and retries at logon if Explorer is still starting up, plus **Run at Windows startup** toggle.
 
