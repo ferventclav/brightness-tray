@@ -602,8 +602,18 @@ impl Renderer {
                 }
             }
 
-            // Bottom toolbar divider
+            // Bottom toolbar footer surface & hairline divider (Fluent 2 flyout pattern)
             let div_y = total_h - TOOLBAR_HEIGHT;
+            let brush_footer = rt.CreateSolidColorBrush(&theme.footer_bg, None)?;
+            ctx.FillRectangle(
+                &D2D_RECT_F {
+                    left: 0.0,
+                    top: div_y,
+                    right: FLYOUT_WIDTH_DIP,
+                    bottom: total_h,
+                },
+                &brush_footer,
+            );
             ctx.DrawLine(
                 D2D_POINT_2F { x: 0.0, y: div_y },
                 D2D_POINT_2F { x: FLYOUT_WIDTH_DIP, y: div_y },

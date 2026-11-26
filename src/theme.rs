@@ -19,6 +19,7 @@ pub struct ThemeColors {
     pub accent: D2D1_COLOR_F,
     pub thumb_ring: D2D1_COLOR_F,
     pub divider: D2D1_COLOR_F,
+    pub footer_bg: D2D1_COLOR_F,
     pub button_hover_bg: D2D1_COLOR_F,
 }
 
@@ -28,38 +29,42 @@ impl ThemeColors {
         let accent = read_accent_color(is_dark);
 
         if is_dark {
+            // Microsoft Fluent 2 / WinUI 3 Dark Theme tokens
             Self {
                 is_dark: true,
-                window_bg: D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
-                window_border: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.09 },
-                card_bg: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.055 },
-                card_hover_bg: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.085 },
-                card_border: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.05 },
-                text_primary: D2D1_COLOR_F { r: 0.96, g: 0.96, b: 0.96, a: 1.0 },
-                text_secondary: D2D1_COLOR_F { r: 0.72, g: 0.72, b: 0.72, a: 1.0 },
-                icon_color: D2D1_COLOR_F { r: 0.90, g: 0.90, b: 0.90, a: 1.0 },
-                slider_track_bg: D2D1_COLOR_F { r: 0.52, g: 0.52, b: 0.52, a: 0.75 },
+                window_bg: D2D1_COLOR_F { r: 0.025, g: 0.025, b: 0.025, a: 0.42 },
+                window_border: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.085 },
+                card_bg: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.0512 },
+                card_hover_bg: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.075 },
+                card_border: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.0578 },
+                text_primary: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
+                text_secondary: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.786 },
+                icon_color: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.92 },
+                slider_track_bg: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.45 },
                 accent,
-                thumb_ring: D2D1_COLOR_F { r: 0.28, g: 0.29, b: 0.27, a: 1.0 },
-                divider: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.07 },
-                button_hover_bg: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.09 },
+                thumb_ring: D2D1_COLOR_F { r: 0.27, g: 0.27, b: 0.27, a: 1.0 },
+                divider: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.075 },
+                footer_bg: D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.16 },
+                button_hover_bg: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.0837 },
             }
         } else {
+            // Microsoft Fluent 2 / WinUI 3 Light Theme tokens
             Self {
                 is_dark: false,
-                window_bg: D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
+                window_bg: D2D1_COLOR_F { r: 0.95, g: 0.95, b: 0.95, a: 0.55 },
                 window_border: D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.08 },
-                card_bg: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.65 },
+                card_bg: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.70 },
                 card_hover_bg: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.85 },
-                card_border: D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.06 },
-                text_primary: D2D1_COLOR_F { r: 0.10, g: 0.10, b: 0.10, a: 1.0 },
-                text_secondary: D2D1_COLOR_F { r: 0.38, g: 0.38, b: 0.38, a: 1.0 },
-                icon_color: D2D1_COLOR_F { r: 0.18, g: 0.18, b: 0.18, a: 1.0 },
-                slider_track_bg: D2D1_COLOR_F { r: 0.55, g: 0.55, b: 0.55, a: 0.55 },
+                card_border: D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0578 },
+                text_primary: D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.895 },
+                text_secondary: D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.606 },
+                icon_color: D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.85 },
+                slider_track_bg: D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.445 },
                 accent,
-                thumb_ring: D2D1_COLOR_F { r: 0.98, g: 0.98, b: 0.98, a: 1.0 },
-                divider: D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.07 },
-                button_hover_bg: D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.06 },
+                thumb_ring: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
+                divider: D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0578 },
+                footer_bg: D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.035 },
+                button_hover_bg: D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.05 },
             }
         }
     }
