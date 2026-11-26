@@ -4,7 +4,7 @@ A lightweight, native Rust Windows system tray app to control brightness across 
 
 Built as a standalone replacement for the PowerToys brightness flyout with zero runtime dependencies (~240 KB binary).
 
-![Brightness Tray flyout preview](docs/flyout-preview.png)
+![Brightness Tray flyout preview](docs/preview.png)
 
 ## Quick Start
 
