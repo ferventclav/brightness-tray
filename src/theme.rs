@@ -32,7 +32,7 @@ impl ThemeColors {
             // Microsoft Fluent 2 / WinUI 3 Dark Theme tokens
             Self {
                 is_dark: true,
-                window_bg: D2D1_COLOR_F { r: 0.025, g: 0.025, b: 0.025, a: 0.42 },
+                window_bg: D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
                 window_border: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.085 },
                 card_bg: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.0512 },
                 card_hover_bg: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.075 },
@@ -51,7 +51,7 @@ impl ThemeColors {
             // Microsoft Fluent 2 / WinUI 3 Light Theme tokens
             Self {
                 is_dark: false,
-                window_bg: D2D1_COLOR_F { r: 0.95, g: 0.95, b: 0.95, a: 0.55 },
+                window_bg: D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
                 window_border: D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.08 },
                 card_bg: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.70 },
                 card_hover_bg: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.85 },

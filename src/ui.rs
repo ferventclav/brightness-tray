@@ -25,7 +25,7 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING,
 };
 use windows::Win32::Graphics::Dwm::{
-    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_SYSTEMBACKDROP_TYPE,
+    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
     DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
@@ -199,6 +199,22 @@ pub fn x_to_brightness(x: f32) -> u32 {
 }
 
 pub fn apply_win11_backdrop(hwnd: HWND, is_dark: bool) {
+    #[repr(C)]
+    struct AccentPolicy {
+        accent_state: u32,
+        accent_flags: u32,
+        gradient_color: u32,
+        animation_id: u32,
+    }
+    #[repr(C)]
+    struct WindowCompositionAttribData {
+        attrib: u32,
+        pv_data: *mut core::ffi::c_void,
+        cb_data: usize,
+    }
+    type SetWindowCompositionAttributeFn =
+        unsafe extern "system" fn(HWND, *mut WindowCompositionAttribData) -> BOOL;
+
     unsafe {
         let dark: BOOL = if is_dark { BOOL(1) } else { BOOL(0) };
         let _ = DwmSetWindowAttribute(
@@ -216,15 +232,6 @@ pub fn apply_win11_backdrop(hwnd: HWND, is_dark: bool) {
             std::mem::size_of_val(&corner) as u32,
         );
 
-        // DWMSBT_TRANSIENTWINDOW = 3 (Acrylic)
-        let backdrop: i32 = 3;
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_SYSTEMBACKDROP_TYPE,
-            &backdrop as *const _ as *const _,
-            std::mem::size_of::<i32>() as u32,
-        );
-
         let margins = MARGINS {
             cxLeftWidth: -1,
             cxRightWidth: -1,
@@ -232,6 +239,33 @@ pub fn apply_win11_backdrop(hwnd: HWND, is_dark: bool) {
             cyBottomHeight: -1,
         };
         let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+
+        // Use SetWindowCompositionAttribute (ACCENT_ENABLE_ACRYLICBLURBEHIND = 4)
+        // because DWMWA_SYSTEMBACKDROP_TYPE does not blur borderless WS_POPUP windows.
+        if let Ok(huser32) =
+            windows::Win32::System::LibraryLoader::GetModuleHandleW(w!("user32.dll"))
+        {
+            if let Some(proc) = windows::Win32::System::LibraryLoader::GetProcAddress(
+                huser32,
+                windows::core::s!("SetWindowCompositionAttribute"),
+            ) {
+                let func: SetWindowCompositionAttributeFn = std::mem::transmute(proc);
+                // AABBGGRR: ~65% dark charcoal in dark mode, ~80% soft white in light mode
+                let gradient_color = if is_dark { 0xA61C1C1C } else { 0xCCF2F2F2 };
+                let mut policy = AccentPolicy {
+                    accent_state: 4, // ACCENT_ENABLE_ACRYLICBLURBEHIND
+                    accent_flags: 2,
+                    gradient_color,
+                    animation_id: 0,
+                };
+                let mut data = WindowCompositionAttribData {
+                    attrib: 19, // WCA_ACCENT_POLICY
+                    pv_data: &mut policy as *mut _ as *mut core::ffi::c_void,
+                    cb_data: std::mem::size_of::<AccentPolicy>(),
+                };
+                let _ = func(hwnd, &mut data);
+            }
+        }
     }
 }
 
