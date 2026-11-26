@@ -30,8 +30,8 @@ impl ThemeColors {
         if is_dark {
             Self {
                 is_dark: true,
-                window_bg: D2D1_COLOR_F { r: 0.13, g: 0.14, b: 0.12, a: 0.72 },
-                window_border: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.10 },
+                window_bg: D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
+                window_border: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.09 },
                 card_bg: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.055 },
                 card_hover_bg: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.085 },
                 card_border: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.05 },
@@ -47,7 +47,7 @@ impl ThemeColors {
         } else {
             Self {
                 is_dark: false,
-                window_bg: D2D1_COLOR_F { r: 0.96, g: 0.96, b: 0.96, a: 0.78 },
+                window_bg: D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
                 window_border: D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.08 },
                 card_bg: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.65 },
                 card_hover_bg: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.85 },
