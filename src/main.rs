@@ -335,6 +335,14 @@ impl AppState {
 }
 
 fn main() {
+    std::panic::set_hook(Box::new(|info| {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            let dir = std::path::PathBuf::from(local).join("BrightnessTray");
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(dir.join("crash.log"), format!("{info}\n"));
+        }
+    }));
+
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);

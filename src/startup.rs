@@ -1,12 +1,15 @@
 use std::os::windows::ffi::OsStrExt;
 use windows::core::w;
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
-    HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_SZ,
+    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
+    RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_BINARY,
+    REG_OPTION_NON_VOLATILE, REG_SZ,
 };
 
 const RUN_SUBKEY: windows::core::PCWSTR =
     w!(r"Software\Microsoft\Windows\CurrentVersion\Run");
+const APPROVED_SUBKEY: windows::core::PCWSTR =
+    w!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run");
 const VALUE_NAME: windows::core::PCWSTR = w!("BrightnessTray");
 
 pub fn is_startup_enabled() -> bool {
@@ -49,6 +52,31 @@ pub fn set_startup_enabled(enable: bool) -> bool {
         };
 
         let _ = RegCloseKey(hkey);
+
+        // Ensure Windows 11 StartupApproved\Run marks the entry enabled/removed
+        let mut app_key = HKEY::default();
+        if RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            APPROVED_SUBKEY,
+            0,
+            None,
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            None,
+            &mut app_key,
+            None,
+        )
+        .is_ok()
+        {
+            if enable {
+                let approved: [u8; 12] = [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+                let _ = RegSetValueExW(app_key, VALUE_NAME, 0, REG_BINARY, Some(&approved));
+            } else {
+                let _ = RegDeleteValueW(app_key, VALUE_NAME);
+            }
+            let _ = RegCloseKey(app_key);
+        }
+
         ok
     }
 }
