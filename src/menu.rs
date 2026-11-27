@@ -38,8 +38,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SystemParametersInfoW, TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
     GWLP_USERDATA, HWND_TOPMOST, IDC_ARROW, IDC_HAND, MSG, SPI_GETWORKAREA, SWP_SHOWWINDOW,
     SW_HIDE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WA_INACTIVE, WM_ACTIVATE, WM_CREATE,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_SETCURSOR, WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_SETCURSOR, WNDCLASSW,
+    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::theme::ThemeColors;
@@ -542,6 +542,13 @@ unsafe extern "system" fn menu_wnd_proc(
         }
         WM_ACTIVATE => {
             if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE {
+                state.closed = true;
+            }
+            LRESULT(0)
+        }
+        WM_KEYDOWN => {
+            if wparam.0 == 0x1B {
+                // VK_ESCAPE
                 state.closed = true;
             }
             LRESULT(0)

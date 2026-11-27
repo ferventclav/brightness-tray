@@ -42,7 +42,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE,
-    NIM_SETVERSION, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
+    NIM_MODIFY, NIM_SETVERSION, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyIcon, DispatchMessageW,
@@ -51,9 +51,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetTimer, SetWindowPos, ShowWindow, TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
     HICON, HWND_TOPMOST, ICONINFO, IDC_ARROW, IDC_HAND, MSG, SM_CXSMICON, SWP_NOACTIVATE,
     SWP_SHOWWINDOW, SW_HIDE, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_COMMAND, WM_CREATE, WM_DESTROY,
-    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_PAINT, WM_POWERBROADCAST, WM_RBUTTONUP, WM_SETCURSOR, WM_SETTINGCHANGE, WM_TIMER,
-    DEVICE_NOTIFY_WINDOW_HANDLE, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND,
+    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_PAINT, WM_POWERBROADCAST, WM_RBUTTONUP, WM_SETCURSOR, WM_SETTINGCHANGE,
+    WM_TIMER, DEVICE_NOTIFY_WINDOW_HANDLE, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND,
     PBT_POWERSETTINGCHANGE, WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_POPUP,
 };
@@ -406,10 +406,10 @@ fn main() {
             worker_tx: worker_tx.clone(),
             hover: HoverTarget::None,
             dragging_idx: None,
-            linked: false,
+            linked: read_reg_bool(w!("Linked"), false),
             ambient_cap: ambient::detect_capability(),
             measuring_ambient: false,
-            auto_on_wake: read_auto_on_wake(),
+            auto_on_wake: read_reg_bool(w!("AutoOnWake"), false),
             visible: false,
             menu_open: false,
             anchor_x: 0,
@@ -648,6 +648,7 @@ unsafe extern "system" fn wnd_proc(
                 if let Ok(guard) = state.shared_monitors.lock() {
                     state.monitors = guard.clone();
                 }
+                update_tray_tooltip(hwnd, &state.monitors);
                 if state.visible {
                     state.resize_and_position();
                     state.render();
@@ -674,6 +675,7 @@ unsafe extern "system" fn wnd_proc(
                         });
                     }
                 }
+                update_tray_tooltip(hwnd, &state.monitors);
                 if state.visible {
                     state.anim_start = Some(Instant::now());
                     let _ = SetTimer(hwnd, TIMER_ANIM_SLIDER, 16, None);
@@ -803,6 +805,12 @@ unsafe extern "system" fn wnd_proc(
             }
             LRESULT(0)
         }
+        WM_KEYDOWN => {
+            if wparam.0 == 0x1B {
+                state.hide_flyout();
+            }
+            LRESULT(0)
+        }
         WM_MOUSEMOVE => {
             if !state.tracking_mouse {
                 let mut tme = TRACKMOUSEEVENT {
@@ -861,6 +869,7 @@ unsafe extern "system" fn wnd_proc(
                 }
                 HoverTarget::LinkButton => {
                     state.linked = !state.linked;
+                    write_reg_bool(w!("Linked"), state.linked);
                     state.render();
                 }
                 HoverTarget::RefreshButton => {
@@ -877,6 +886,7 @@ unsafe extern "system" fn wnd_proc(
             if state.dragging_idx.is_some() {
                 state.dragging_idx = None;
                 let _ = ReleaseCapture();
+                update_tray_tooltip(hwnd, &state.monitors);
                 state.render();
             }
             LRESULT(0)
@@ -898,6 +908,7 @@ unsafe extern "system" fn wnd_proc(
                 let cur = state.monitors[idx].brightness as i32;
                 let next = (cur + step).clamp(0, 100) as f32;
                 state.set_monitor_brightness_f32(idx, next, false);
+                update_tray_tooltip(hwnd, &state.monitors);
             }
             LRESULT(0)
         }
@@ -913,10 +924,11 @@ unsafe extern "system" fn wnd_proc(
                 }
                 CMD_TOGGLE_WAKE_AUTO => {
                     state.auto_on_wake = !state.auto_on_wake;
-                    write_auto_on_wake(state.auto_on_wake);
+                    write_reg_bool(w!("AutoOnWake"), state.auto_on_wake);
                 }
                 CMD_TOGGLE_LINK => {
                     state.linked = !state.linked;
+                    write_reg_bool(w!("Linked"), state.linked);
                     if state.visible {
                         state.render();
                     }
@@ -1114,7 +1126,33 @@ fn ease_in_out_cubic(t: f32) -> f32 {
     }
 }
 
-fn read_auto_on_wake() -> bool {
+fn update_tray_tooltip(hwnd: HWND, monitors: &[UiMonitor]) {
+    let tip_text = if monitors.is_empty() {
+        "Display Brightness".to_string()
+    } else {
+        let parts: Vec<String> = monitors
+            .iter()
+            .map(|m| format!("{}: {}%", m.name, m.brightness))
+            .collect();
+        format!("Display Brightness\n{}", parts.join(" · "))
+    };
+    unsafe {
+        let mut nid = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: hwnd,
+            uID: TRAY_ICON_ID,
+            uFlags: NIF_TIP | NIF_SHOWTIP,
+            ..Default::default()
+        };
+        let tip: Vec<u16> = tip_text.encode_utf16().chain(std::iter::once(0)).collect();
+        let len = tip.len().min(nid.szTip.len());
+        nid.szTip[..len].copy_from_slice(&tip[..len]);
+        nid.szTip[nid.szTip.len() - 1] = 0;
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+    }
+}
+
+fn read_reg_bool(name: PCWSTR, default: bool) -> bool {
     unsafe {
         let mut hkey = HKEY::default();
         if RegOpenKeyExW(
@@ -1126,25 +1164,25 @@ fn read_auto_on_wake() -> bool {
         )
         .is_err()
         {
-            return false;
+            return default;
         }
-        let mut data: u32 = 0;
+        let mut data: u32 = if default { 1 } else { 0 };
         let mut size = std::mem::size_of::<u32>() as u32;
         let mut reg_type = REG_DWORD;
         let res = RegQueryValueExW(
             hkey,
-            w!("AutoOnWake"),
+            name,
             None,
             Some(&mut reg_type),
             Some(&mut data as *mut u32 as *mut u8),
             Some(&mut size),
         );
         let _ = RegCloseKey(hkey);
-        if res.is_ok() { data != 0 } else { false }
+        if res.is_ok() { data != 0 } else { default }
     }
 }
 
-fn write_auto_on_wake(enabled: bool) {
+fn write_reg_bool(name: PCWSTR, enabled: bool) {
     unsafe {
         let mut hkey = HKEY::default();
         if RegCreateKeyExW(
@@ -1165,7 +1203,7 @@ fn write_auto_on_wake(enabled: bool) {
                 &data as *const u32 as *const u8,
                 std::mem::size_of::<u32>(),
             );
-            let _ = RegSetValueExW(hkey, w!("AutoOnWake"), 0, REG_DWORD, Some(bytes));
+            let _ = RegSetValueExW(hkey, name, 0, REG_DWORD, Some(bytes));
             let _ = RegCloseKey(hkey);
         }
     }
