@@ -59,7 +59,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use ambient::AmbientCapability;
-use monitors::{BackendKind, MonitorManager};
+use monitors::MonitorManager;
 use theme::ThemeColors;
 use ui::{
     apply_win11_backdrop, card_index_at, compute_flyout_height_dip, compute_flyout_position,
@@ -86,7 +86,7 @@ const CMD_TOGGLE_WAKE_AUTO: usize = 1006;
 
 enum WorkerCmd {
     Refresh,
-    SetBrightness { id: String, brightness: u32 },
+    SetBrightness { id: String, brightness: u32, smooth: bool },
     Shutdown,
 }
 
@@ -243,7 +243,7 @@ impl AppState {
         }
     }
 
-    fn set_monitor_brightness_f32(&mut self, idx: usize, new_val_f32: f32) {
+    fn set_monitor_brightness_f32(&mut self, idx: usize, new_val_f32: f32, smooth: bool) {
         let new_val_f32 = new_val_f32.clamp(0.0, 100.0);
         let new_val = new_val_f32.round() as u32;
         let Some(old_val_f32) = self.monitors.get(idx).map(|m| m.visual_brightness) else {
@@ -259,7 +259,9 @@ impl AppState {
                 } else {
                     (mon.visual_brightness + delta_f32).clamp(0.0, 100.0)
                 };
-                mon.visual_brightness = target_f32;
+                if !smooth {
+                    mon.visual_brightness = target_f32;
+                }
                 let target = target_f32.round() as u32;
                 if mon.brightness != target {
                     mon.brightness = target;
@@ -269,11 +271,14 @@ impl AppState {
                     let _ = self.worker_tx.send(WorkerCmd::SetBrightness {
                         id: mon.id.clone(),
                         brightness: target,
+                        smooth,
                     });
                 }
             }
         } else if let Some(mon) = self.monitors.get_mut(idx) {
-            mon.visual_brightness = new_val_f32;
+            if !smooth {
+                mon.visual_brightness = new_val_f32;
+            }
             if old_val != new_val {
                 mon.brightness = new_val;
                 if let Ok(mut map) = self.latest_targets.lock() {
@@ -282,6 +287,7 @@ impl AppState {
                 let _ = self.worker_tx.send(WorkerCmd::SetBrightness {
                     id: mon.id.clone(),
                     brightness: new_val,
+                    smooth,
                 });
             }
         }
@@ -456,13 +462,13 @@ fn main() {
 
             while let Ok(first_cmd) = worker_rx.recv() {
                 let mut do_refresh = false;
-                let mut pending_sets: HashMap<String, u32> = HashMap::new();
+                let mut pending_sets: HashMap<String, (u32, bool)> = HashMap::new();
                 let mut should_exit = false;
 
                 let mut process_cmd = |cmd: WorkerCmd| match cmd {
                     WorkerCmd::Refresh => do_refresh = true,
-                    WorkerCmd::SetBrightness { id, brightness } => {
-                        pending_sets.insert(id, brightness);
+                    WorkerCmd::SetBrightness { id, brightness, smooth } => {
+                        pending_sets.insert(id, (brightness, smooth));
                     }
                     WorkerCmd::Shutdown => should_exit = true,
                 };
@@ -479,53 +485,67 @@ fn main() {
                     mgr.refresh();
                     publish_monitors(&mgr, &shared_for_worker, hwnd_raw);
                 }
-                for (id, initial_target) in pending_sets {
-                    let is_wmi = mgr
-                        .monitors
-                        .iter()
-                        .find(|m| m.id == id)
-                        .map(|m| matches!(m.backend, BackendKind::InternalWmi))
-                        .unwrap_or(false);
+
+                let mut smooth_jobs: Vec<(String, u32, u32)> = Vec::new();
+                for (id, (initial_target, smooth)) in pending_sets {
+                    let target = targets_for_worker
+                        .lock()
+                        .ok()
+                        .and_then(|m| m.get(&id).copied())
+                        .unwrap_or(initial_target);
                     let current = mgr
                         .monitors
                         .iter()
                         .find(|m| m.id == id)
                         .map(|m| m.brightness)
-                        .unwrap_or(initial_target);
+                        .unwrap_or(target);
 
-                    let latest_for_id = || -> u32 {
-                        targets_for_worker
-                            .lock()
-                            .ok()
-                            .and_then(|m| m.get(&id).copied())
-                            .unwrap_or(initial_target)
-                    };
-
-                    let target = latest_for_id();
-                    if current.abs_diff(target) > 3 {
-                        let diff = current.abs_diff(target);
-                        let steps = if is_wmi { diff.min(32) } else { diff.min(22) };
-                        let delay_ms = if is_wmi { 22 } else { 32 };
-                        for s in 1..=steps {
-                            if latest_for_id() != target {
-                                mgr.set_brightness(&id, latest_for_id());
-                                break;
-                            }
-                            let t = s as f32 / steps as f32;
-                            // Ease-in-out cubic: gentle start, smooth middle, soft settle (~700ms)
-                            let eased = ease_in_out_cubic(t);
-                            let val = (current as f32 + (target as f32 - current as f32) * eased)
-                                .round()
-                                .clamp(0.0, 100.0) as u32;
-                            mgr.set_brightness(&id, val);
-                            if s < steps {
-                                std::thread::sleep(Duration::from_millis(delay_ms));
-                            }
-                        }
+                    if smooth && current.abs_diff(target) > 3 {
+                        smooth_jobs.push((id, current, target));
                     } else {
                         mgr.set_brightness(&id, target);
-                        if !is_wmi {
-                            std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
+
+                // Interleave smooth transitions across ALL monitors simultaneously
+                if !smooth_jobs.is_empty() {
+                    let max_diff = smooth_jobs
+                        .iter()
+                        .map(|(_, c, t)| c.abs_diff(*t))
+                        .max()
+                        .unwrap_or(0);
+                    let steps = max_diff.min(24);
+                    let delay_ms = 26u64;
+
+                    'ramp: for s in 1..=steps {
+                        let t = s as f32 / steps as f32;
+                        let eased = ease_in_out_cubic(t);
+
+                        for (id, current, target) in &smooth_jobs {
+                            let latest = targets_for_worker
+                                .lock()
+                                .ok()
+                                .and_then(|m| m.get(id).copied())
+                                .unwrap_or(*target);
+                            if latest != *target {
+                                // User grabbed a slider mid-ramp: apply latest immediately and abort ramp
+                                for (rem_id, _, rem_tgt) in &smooth_jobs {
+                                    let l = targets_for_worker
+                                        .lock()
+                                        .ok()
+                                        .and_then(|m| m.get(rem_id).copied())
+                                        .unwrap_or(*rem_tgt);
+                                    mgr.set_brightness(rem_id, l);
+                                }
+                                break 'ramp;
+                            }
+                            let val = (*current as f32 + (*target as f32 - *current as f32) * eased)
+                                .round()
+                                .clamp(0.0, 100.0) as u32;
+                            mgr.set_brightness(id, val);
+                        }
+                        if s < steps {
+                            std::thread::sleep(Duration::from_millis(delay_ms));
                         }
                     }
                 }
@@ -650,6 +670,7 @@ unsafe extern "system" fn wnd_proc(
                         let _ = state.worker_tx.send(WorkerCmd::SetBrightness {
                             id: mon.id.clone(),
                             brightness: pct,
+                            smooth: true,
                         });
                     }
                 }
@@ -800,7 +821,7 @@ unsafe extern "system" fn wnd_proc(
 
             if let Some(idx) = state.dragging_idx {
                 let b = x_to_brightness_f32(x);
-                state.set_monitor_brightness_f32(idx, b);
+                state.set_monitor_brightness_f32(idx, b, false);
             } else {
                 let total_h = compute_flyout_height_dip(state.monitors.len());
                 let show_auto = state.ambient_cap != AmbientCapability::None;
@@ -833,7 +854,7 @@ unsafe extern "system" fn wnd_proc(
                     state.dragging_idx = Some(idx);
                     SetCapture(hwnd);
                     let b = x_to_brightness_f32(x);
-                    state.set_monitor_brightness_f32(idx, b);
+                    state.set_monitor_brightness_f32(idx, b, false);
                 }
                 HoverTarget::AutoButton => {
                     state.trigger_ambient_measure();
@@ -876,7 +897,7 @@ unsafe extern "system" fn wnd_proc(
             if let Some(idx) = card_index_at(x, y, state.monitors.len()) {
                 let cur = state.monitors[idx].brightness as i32;
                 let next = (cur + step).clamp(0, 100) as f32;
-                state.set_monitor_brightness_f32(idx, next);
+                state.set_monitor_brightness_f32(idx, next, false);
             }
             LRESULT(0)
         }
