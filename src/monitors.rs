@@ -120,19 +120,9 @@ impl MonitorManager {
             let meta = config_map.get(&gdi_name);
             let is_internal = meta.map(|m| m.is_internal).unwrap_or(false);
 
-            let base_name = if is_internal {
-                "Built-in display".to_string()
-            } else if let Some(m) = meta {
-                if !m.friendly_name.is_empty() {
-                    m.friendly_name.clone()
-                } else {
-                    format!("Display {}", display_number)
-                }
-            } else {
-                format!("Display {}", display_number)
-            };
-
-            let display_label = format!("{} {}", base_name, display_number);
+            // The card badge already shows the display number, so the label carries only the name.
+            let display_label =
+                display_label(is_internal, meta.map(|m| m.friendly_name.as_str()));
 
             if is_internal {
                 if let Some(cur) = wmi_brightness {
@@ -225,6 +215,16 @@ impl MonitorManager {
             mon.brightness = pct;
         }
         ok
+    }
+}
+
+pub fn display_label(is_internal: bool, friendly_name: Option<&str>) -> String {
+    if is_internal {
+        return "Built-in display".to_string();
+    }
+    match friendly_name.map(str::trim) {
+        Some(name) if !name.is_empty() => name.to_string(),
+        _ => "External display".to_string(),
     }
 }
 
@@ -523,6 +523,14 @@ mod tests {
         unsafe {
             CoUninitialize();
         }
+    }
+
+    #[test]
+    fn test_display_label_has_no_number() {
+        assert_eq!(display_label(false, Some("MAG 27CQ6F")), "MAG 27CQ6F");
+        assert_eq!(display_label(false, Some("  ")), "External display");
+        assert_eq!(display_label(false, None), "External display");
+        assert_eq!(display_label(true, Some("Generic PnP")), "Built-in display");
     }
 
     #[test]

@@ -139,8 +139,10 @@ unsafe fn check_hkey_recursive(hkey: HKEY, depth: u32) -> bool {
 
 /// Measures room ambient light using the default physical webcam in read-only mode
 /// (never taking exclusive control or changing camera settings).
-/// Immediately skips if another app is already using the camera or camera access is denied,
-/// and shuts down within ~2.8s max.
+/// Skips when camera access is denied, or when the ConsentStore shows another app streaming.
+/// Recent Windows 11 builds stopped updating that store, so the in-use check can miss a busy
+/// camera; the open then fails without disturbing the other app and this returns Unavailable.
+/// Shuts down within ~2.8 s of the camera starting.
 pub fn measure_room_brightness() -> AmbientResult {
     if is_camera_access_denied() {
         return AmbientResult::CameraDenied;

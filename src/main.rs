@@ -44,28 +44,30 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE,
-    NIM_MODIFY, NIM_SETVERSION, NIN_SELECT, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
+    Shell_NotifyIconGetRect, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP,
+    NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NIN_SELECT, NOTIFYICONDATAW,
+    NOTIFYICONIDENTIFIER, NOTIFYICON_VERSION_4,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyIcon, DispatchMessageW,
-    GetCursorPos, GetForegroundWindow, GetMessageW, GetSystemMetrics, GetWindowRect, KillTimer,
-    LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetCursor,
-    SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, TranslateMessage, CREATESTRUCTW,
-    CS_HREDRAW, CS_VREDRAW, HICON, HWND_TOPMOST, ICONINFO, IDC_ARROW, IDC_HAND, MSG, SM_CXSMICON,
-    SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CAPTURECHANGED,
-    WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_KEYDOWN,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_POWERBROADCAST,
-    WM_RBUTTONUP, WM_SETCURSOR, WM_SETTINGCHANGE, WM_TIMER, DEVICE_NOTIFY_WINDOW_HANDLE,
-    PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_POWERSETTINGCHANGE, WNDCLASSW,
-    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    AllowSetForegroundWindow, CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyIcon,
+    DispatchMessageW, FindWindowW, GetCursorPos, GetForegroundWindow, GetMessageW,
+    GetSystemMetrics, GetWindowRect, GetWindowThreadProcessId, KillTimer, LoadCursorW,
+    PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow,
+    SetTimer, SetWindowPos, ShowWindow, TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
+    HICON, HWND_TOPMOST, ICONINFO, IDC_ARROW, MSG, SM_CXSMICON, SWP_NOACTIVATE, SWP_SHOWWINDOW,
+    SW_HIDE, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CAPTURECHANGED, WM_COMMAND, WM_CREATE,
+    WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_POWERBROADCAST, WM_RBUTTONUP, WM_SETTINGCHANGE,
+    WM_TIMER, DEVICE_NOTIFY_WINDOW_HANDLE, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND,
+    PBT_POWERSETTINGCHANGE, WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP,
 };
 
 use ambient::{AmbientCapability, AmbientResult};
 use monitors::{BackendKind, MonitorManager};
 use theme::ThemeColors;
 use ui::{
-    apply_win11_backdrop, card_index_at, compute_flyout_height_dip, compute_flyout_position,
+    apply_win11_backdrop, button_rects, card_index_at, compute_flyout_height_dip, compute_flyout_position,
     hit_test, monitor_work_area_and_dpi_at, x_to_brightness_f32, HoverTarget, RenderState,
     Renderer, UiMonitor, FLYOUT_WIDTH_DIP,
 };
@@ -73,6 +75,11 @@ use ui::{
 const WM_TRAY_ICON: u32 = WM_APP + 1;
 const WM_MONITORS_UPDATED: u32 = WM_APP + 2;
 const WM_AUTO_BRIGHTNESS_RESULT: u32 = WM_APP + 3;
+const WM_WORKER_STATUS: u32 = WM_APP + 4;
+const WM_SHOW_FROM_RELAUNCH: u32 = WM_APP + 5;
+/// Covers a slow USB webcam: up to ~2 s to start streaming plus the 2.8 s capture watchdog.
+const AMBIENT_TIMEOUT_MS: u32 = 6000;
+const WHEEL_DELTA: i32 = 120;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const WM_DWMCOLORIZATIONCOLORCHANGED: u32 = 0x0320;
 const NIN_KEYSELECT: u32 = NIN_SELECT + 1;
@@ -127,6 +134,8 @@ struct AppState {
     dragging_idx: Option<usize>,
     drag_anchors: Option<Vec<(String, f32)>>,
     focused_idx: Option<usize>,
+    /// Keyboard focus on a footer button; never set together with `focused_idx`
+    focused_btn: Option<HoverTarget>,
     linked: bool,
     ambient_cap: AmbientCapability,
     measuring_ambient: bool,
@@ -134,6 +143,7 @@ struct AppState {
     refresh_angle: f32,
     ddc_retry_scheduled: bool,
     status_msg: Option<String>,
+    status_is_error: bool,
     auto_on_wake: bool,
     visible: bool,
     menu_open: bool,
@@ -142,6 +152,12 @@ struct AppState {
     last_hide_time: Instant,
     anim_start: Option<Instant>,
     tracking_mouse: bool,
+    wheel_accum: i32,
+    wheel_card: Option<usize>,
+    lid_open: Option<bool>,
+    ambient_seq: u64,
+    ambient_busy: Arc<AtomicBool>,
+    worker_status: Arc<Mutex<Option<String>>>,
 }
 
 impl AppState {
@@ -168,27 +184,119 @@ impl AppState {
         } else if let Some(msg) = self.status_msg.as_deref() {
             Some(msg)
         } else {
-            match self.hover {
-                HoverTarget::AutoButton => Some("Match room light"),
+            // Hover wins; otherwise describe the footer button that has keyboard focus.
+            // The letter is the keyboard shortcut, so hovering teaches it.
+            let target = match (self.hover, self.focused_btn) {
+                (HoverTarget::None, Some(b)) => b,
+                (h, _) => h,
+            };
+            match target {
+                HoverTarget::AutoButton => Some("Match room light (A)"),
                 HoverTarget::LinkButton => Some(if self.linked {
-                    "Linked (adjusts all)"
+                    "Displays linked (L)"
                 } else {
-                    "Link sliders"
+                    "Link displays (L)"
                 }),
-                HoverTarget::RefreshButton => Some("Refresh displays"),
+                HoverTarget::RefreshButton => Some("Refresh displays (R)"),
                 HoverTarget::SettingsButton => Some("Settings"),
                 _ => None,
             }
         }
     }
 
+    fn footer_hint_is_error(&self) -> bool {
+        self.status_is_error && self.status_msg.is_some() && !self.measuring_ambient && !self.refreshing
+    }
+
     fn set_status(&mut self, msg: &str, duration_ms: u32) {
         self.status_msg = Some(msg.to_string());
+        self.status_is_error = false;
         unsafe {
             let _ = SetTimer(self.hwnd, TIMER_STATUS_CLEAR, duration_ms, None);
         }
         if self.visible {
             self.render();
+        }
+    }
+
+    /// Something the user asked for did not happen: primary text, and long enough to read.
+    fn set_error(&mut self, msg: &str) {
+        self.set_status(msg, 4500);
+        self.status_is_error = true;
+        if self.visible {
+            self.render();
+        }
+    }
+
+    fn footer_buttons(&self) -> Vec<HoverTarget> {
+        let total_h = compute_flyout_height_dip(self.monitors.len());
+        button_rects(total_h, self.ambient_cap != AmbientCapability::None)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect()
+    }
+
+    /// Tab order: each display card, then the footer buttons left to right, then around again.
+    fn cycle_focus(&mut self, backwards: bool) {
+        let mut order: Vec<(Option<usize>, Option<HoverTarget>)> =
+            (0..self.monitors.len()).map(|i| (Some(i), None)).collect();
+        order.extend(self.footer_buttons().into_iter().map(|b| (None, Some(b))));
+        let n = order.len();
+        if n == 0 {
+            return;
+        }
+        let current = order.iter().position(|(card, btn)| {
+            (card.is_some() && *card == self.focused_idx) || (btn.is_some() && *btn == self.focused_btn)
+        });
+        let next = match current {
+            Some(p) if backwards => (p + n - 1) % n,
+            Some(p) => (p + 1) % n,
+            None if backwards => n - 1,
+            None => 0,
+        };
+        self.focused_idx = order[next].0;
+        self.focused_btn = order[next].1;
+        self.render();
+    }
+
+    /// Screen point just above the middle of a footer button, for anchoring the settings menu.
+    fn button_screen_anchor(&self, target: HoverTarget) -> Option<POINT> {
+        let total_h = compute_flyout_height_dip(self.monitors.len());
+        let (_, r) = button_rects(total_h, self.ambient_cap != AmbientCapability::None)
+            .into_iter()
+            .find(|(t, _)| *t == target)?;
+        let scale = self.dpi() as f32 / 96.0;
+        let mut pt = POINT {
+            x: (((r.left + r.right) / 2.0) * scale).round() as i32,
+            y: (r.top * scale).round() as i32,
+        };
+        unsafe {
+            let _ = windows::Win32::Graphics::Gdi::ClientToScreen(self.hwnd, &mut pt);
+        }
+        Some(pt)
+    }
+
+    fn invoke_button(&mut self, target: HoverTarget, from_keyboard: bool) {
+        match target {
+            HoverTarget::AutoButton => self.trigger_ambient_measure(),
+            HoverTarget::LinkButton => {
+                self.linked = !self.linked;
+                write_reg_bool(w!("Linked"), self.linked);
+                self.render();
+            }
+            HoverTarget::RefreshButton => {
+                self.ddc_retry_scheduled = false;
+                self.request_refresh(true);
+            }
+            HoverTarget::SettingsButton => {
+                let anchor = if from_keyboard {
+                    self.button_screen_anchor(HoverTarget::SettingsButton)
+                } else {
+                    None
+                };
+                self.show_context_menu(anchor);
+            }
+            _ => {}
         }
     }
 
@@ -207,6 +315,8 @@ impl AppState {
             refresh_angle: self.refresh_angle,
             show_auto: self.ambient_cap != AmbientCapability::None,
             footer_hint: hint.as_deref(),
+            footer_hint_strong: self.footer_hint_is_error(),
+            focused_btn: self.focused_btn,
             dpi,
         };
         let needs_recreate = match &self.renderer {
@@ -235,35 +345,47 @@ impl AppState {
     }
 
     fn trigger_ambient_measure(&mut self) {
-        if self.ambient_cap == AmbientCapability::None {
+        if self.ambient_cap == AmbientCapability::None || self.measuring_ambient {
             return;
         }
-        if !self.measuring_ambient {
-            self.measuring_ambient = true;
-            self.status_msg = None;
-            let hwnd_raw = self.hwnd.0 as isize;
+        // A measurement that timed out can still be holding the camera; never start a second one.
+        if self.ambient_busy.swap(true, Ordering::AcqRel) {
+            self.set_status("Still measuring, try again", 2400);
+            return;
+        }
+        self.measuring_ambient = true;
+        self.status_msg = None;
+        self.ambient_seq = self.ambient_seq.wrapping_add(1);
+        let seq = self.ambient_seq;
+        let busy = self.ambient_busy.clone();
+        let hwnd_raw = self.hwnd.0 as isize;
+        unsafe {
+            let _ = SetTimer(self.hwnd, TIMER_AMBIENT_TIMEOUT, AMBIENT_TIMEOUT_MS, None);
+        }
+        std::thread::spawn(move || {
+            // WinRT LightSensor and Media Foundation both need COM on this thread
+            let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
+            let code = match ambient::measure_ambient_brightness() {
+                AmbientResult::Brightness(b) => b.min(100) as usize,
+                AmbientResult::CameraInUse => AMBIENT_RES_CAMERA_IN_USE,
+                AmbientResult::CameraDenied => AMBIENT_RES_CAMERA_DENIED,
+                AmbientResult::Unavailable => AMBIENT_RES_UNAVAILABLE,
+            };
+            if com {
+                unsafe { CoUninitialize() };
+            }
+            busy.store(false, Ordering::Release);
             unsafe {
-                let _ = SetTimer(self.hwnd, TIMER_AMBIENT_TIMEOUT, 3500, None);
+                let _ = PostMessageW(
+                    HWND(hwnd_raw as *mut core::ffi::c_void),
+                    WM_AUTO_BRIGHTNESS_RESULT,
+                    WPARAM(code),
+                    LPARAM(seq as isize),
+                );
             }
-            std::thread::spawn(move || {
-                let code = match ambient::measure_ambient_brightness() {
-                    AmbientResult::Brightness(b) => b.min(100) as usize,
-                    AmbientResult::CameraInUse => AMBIENT_RES_CAMERA_IN_USE,
-                    AmbientResult::CameraDenied => AMBIENT_RES_CAMERA_DENIED,
-                    AmbientResult::Unavailable => AMBIENT_RES_UNAVAILABLE,
-                };
-                unsafe {
-                    let _ = PostMessageW(
-                        HWND(hwnd_raw as *mut core::ffi::c_void),
-                        WM_AUTO_BRIGHTNESS_RESULT,
-                        WPARAM(code),
-                        LPARAM(0),
-                    );
-                }
-            });
-            if self.visible {
-                self.render();
-            }
+        });
+        if self.visible {
+            self.render();
         }
     }
 
@@ -298,20 +420,21 @@ impl AppState {
         }
     }
 
-    fn show_flyout(&mut self) {
+    /// `anchor` is the screen point the flyout opens beside: the cursor for a mouse click,
+    /// the tray icon for keyboard selection or a relaunch.
+    fn show_flyout(&mut self, anchor: POINT) {
         self.theme = ThemeColors::load();
         apply_win11_backdrop(self.hwnd, self.theme.is_dark);
         self.focused_idx = None;
+        self.focused_btn = None;
         self.status_msg = None;
+        self.wheel_accum = 0;
+        self.wheel_card = None;
         self.request_refresh(false);
 
-        let mut cursor = POINT::default();
-        unsafe {
-            let _ = GetCursorPos(&mut cursor);
-        }
-        let (_, target_dpi) = monitor_work_area_and_dpi_at(cursor);
+        let (_, target_dpi) = monitor_work_area_and_dpi_at(anchor);
         let (w, h) = self.size_px_for_dpi(target_dpi);
-        let (x, y) = compute_flyout_position(w as i32, h as i32, target_dpi);
+        let (x, y) = compute_flyout_position(anchor, w as i32, h as i32, target_dpi);
         self.anchor_x = x;
         if let Some(r) = &mut self.renderer {
             let _ = r.resize(w, h, target_dpi as f32);
@@ -347,6 +470,7 @@ impl AppState {
             self.dragging_idx = None;
             self.drag_anchors = None;
             self.focused_idx = None;
+            self.focused_btn = None;
             self.hover = HoverTarget::None;
             self.refreshing = false;
             self.refresh_angle = 0.0;
@@ -361,12 +485,21 @@ impl AppState {
         }
     }
 
-    fn toggle_flyout(&mut self) {
+    fn toggle_flyout(&mut self, anchor: POINT) {
         if self.visible {
-            self.hide_flyout();
+            // A double click or a repeated select notification must not close what just opened
+            if self.last_show_time.elapsed() > Duration::from_millis(250) {
+                self.hide_flyout();
+            }
         } else if self.last_hide_time.elapsed() > Duration::from_millis(180) {
-            self.show_flyout();
+            self.show_flyout(anchor);
         }
+    }
+
+    fn nudge_brightness(&mut self, idx: usize, next: i32) {
+        let next = next.clamp(0, 100) as f32;
+        self.set_monitor_brightness_f32(idx, next, false);
+        update_tray_tooltip(self.hwnd, &self.monitors);
     }
 
     fn set_monitor_brightness_f32(&mut self, idx: usize, new_val_f32: f32, smooth: bool) {
@@ -444,7 +577,8 @@ impl AppState {
         self.render();
     }
 
-    fn show_context_menu(&mut self) {
+    /// `anchor`: where to open the menu; the cursor when `None` (right-click, gear click).
+    fn show_context_menu(&mut self, anchor: Option<POINT>) {
         let mut entries = Vec::new();
         if self.ambient_cap != AmbientCapability::None {
             entries.push(menu::MenuEntry::Item {
@@ -462,7 +596,7 @@ impl AppState {
         }
         entries.push(menu::MenuEntry::Item {
             id: CMD_TOGGLE_LINK,
-            label: "Link monitors".to_string(),
+            label: "Link displays".to_string(),
             glyph: 0xE71B, // Link
             checked: Some(self.linked),
         });
@@ -474,7 +608,7 @@ impl AppState {
         });
         entries.push(menu::MenuEntry::Item {
             id: CMD_REFRESH,
-            label: "Refresh monitors".to_string(),
+            label: "Refresh displays".to_string(),
             glyph: 0xE72C, // Refresh
             checked: None,
         });
@@ -486,10 +620,13 @@ impl AppState {
             checked: None,
         });
 
-        let mut pt = POINT::default();
-        unsafe {
-            let _ = GetCursorPos(&mut pt);
-        }
+        let pt = anchor.unwrap_or_else(|| {
+            let mut cursor = POINT::default();
+            unsafe {
+                let _ = GetCursorPos(&mut cursor);
+            }
+            cursor
+        });
         self.menu_open = true;
         let selected = menu::show_fluent_menu(self.hwnd, pt, ThemeColors::load(), entries);
         self.menu_open = false;
@@ -538,15 +675,25 @@ fn main() {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
-        // Single-instance guard
+        let class_name = w!("BrightnessTrayFlyoutClass");
+
+        // Single-instance guard: launching the exe again opens the running copy's flyout
         let _mutex = CreateMutexW(None, true, w!("Local\\BrightnessTraySingleInstance"));
         if GetLastError() == ERROR_ALREADY_EXISTS {
+            if let Ok(existing) = FindWindowW(class_name, PCWSTR::null()) {
+                let mut pid = 0u32;
+                GetWindowThreadProcessId(existing, Some(&mut pid));
+                let _ = AllowSetForegroundWindow(pid);
+                let _ = PostMessageW(existing, WM_SHOW_FROM_RELAUNCH, WPARAM(0), LPARAM(0));
+            }
             CoUninitialize();
             return;
         }
 
+        // A moved exe leaves a dead Run entry behind; point it here
+        startup::repair_moved_path();
+
         let hinstance: HINSTANCE = GetModuleHandleW(None).unwrap().into();
-        let class_name = w!("BrightnessTrayFlyoutClass");
 
         let wc = WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW,
@@ -567,6 +714,7 @@ fn main() {
         let latest_targets: Arc<Mutex<HashMap<String, u32>>> = Arc::new(Mutex::new(HashMap::new()));
         let interaction_gen = Arc::new(AtomicU64::new(0));
         let abort_ramp = Arc::new(AtomicBool::new(false));
+        let worker_status: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let (worker_tx, worker_rx) = mpsc::channel::<WorkerCmd>();
 
         let theme = ThemeColors::load();
@@ -589,6 +737,7 @@ fn main() {
             dragging_idx: None,
             drag_anchors: None,
             focused_idx: None,
+            focused_btn: None,
             linked: read_reg_bool(w!("Linked"), false),
             ambient_cap: AmbientCapability::None,
             measuring_ambient: false,
@@ -596,6 +745,7 @@ fn main() {
             refresh_angle: 0.0,
             ddc_retry_scheduled: false,
             status_msg: None,
+            status_is_error: false,
             auto_on_wake: read_reg_bool(w!("AutoOnWake"), false),
             visible: false,
             menu_open: false,
@@ -604,6 +754,12 @@ fn main() {
             last_hide_time: Instant::now() - Duration::from_secs(10),
             anim_start: None,
             tracking_mouse: false,
+            wheel_accum: 0,
+            wheel_card: None,
+            lid_open: None,
+            ambient_seq: 0,
+            ambient_busy: Arc::new(AtomicBool::new(false)),
+            worker_status: worker_status.clone(),
         });
 
         let state_ptr = &mut *state as *mut AppState;
@@ -643,11 +799,13 @@ fn main() {
         let shared_for_worker = shared_snapshot.clone();
         let targets_for_worker = latest_targets.clone();
         let abort_for_worker = abort_ramp.clone();
+        let status_for_worker = worker_status.clone();
         std::thread::spawn(move || {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             let mut mgr = MonitorManager::new();
-            let cap = ambient::detect_capability();
+            let mut cap = ambient::detect_capability();
             publish_snapshot(&mgr, cap, 0, &shared_for_worker, hwnd_raw);
+            let mut last_recovery = Instant::now() - Duration::from_secs(60);
 
             while let Ok(first_cmd) = worker_rx.recv() {
                 let mut refresh_gen: Option<u64> = None;
@@ -672,10 +830,11 @@ fn main() {
                 }
                 if let Some(gen) = refresh_gen {
                     mgr.refresh();
-                    let cap = ambient::detect_capability();
+                    cap = ambient::detect_capability();
                     publish_snapshot(&mgr, cap, gen, &shared_for_worker, hwnd_raw);
                 }
 
+                let mut failed: Vec<String> = Vec::new();
                 let mut smooth_jobs: Vec<(String, u32, u32, bool)> = Vec::new();
                 for (id, (initial_target, smooth)) in pending_sets {
                     let target = targets_for_worker
@@ -691,8 +850,8 @@ fn main() {
 
                     if smooth && current.abs_diff(target) > 3 {
                         smooth_jobs.push((id, current, target, is_internal));
-                    } else {
-                        mgr.set_brightness(&id, target);
+                    } else if !mgr.set_brightness(&id, target) {
+                        failed.push(id);
                     }
                 }
 
@@ -749,6 +908,7 @@ fn main() {
                                     last_sent[j] = Some(val);
                                 } else {
                                     alive[j] = false;
+                                    failed.push(id.clone());
                                 }
                             }
                         }
@@ -756,6 +916,19 @@ fn main() {
                             std::thread::sleep(Duration::from_millis(delay_ms));
                         }
                     }
+                }
+
+                if !failed.is_empty() {
+                    recover_failed_sets(
+                        &mut mgr,
+                        failed,
+                        cap,
+                        &targets_for_worker,
+                        &shared_for_worker,
+                        &status_for_worker,
+                        hwnd_raw,
+                        &mut last_recovery,
+                    );
                 }
             }
 
@@ -816,6 +989,120 @@ fn publish_snapshot(
     }
 }
 
+/// A display that stops answering (after sleep, a cable re-plug or an input switch) usually has a
+/// stale handle. Re-scan once, retry the latest target, and tell the user if it still fails, so
+/// the slider never claims a brightness the monitor did not take.
+#[allow(clippy::too_many_arguments)]
+fn recover_failed_sets(
+    mgr: &mut MonitorManager,
+    mut failed: Vec<String>,
+    cap: AmbientCapability,
+    targets: &Arc<Mutex<HashMap<String, u32>>>,
+    shared: &Arc<Mutex<RefreshSnapshot>>,
+    status: &Arc<Mutex<Option<String>>>,
+    hwnd_raw: isize,
+    last_recovery: &mut Instant,
+) {
+    failed.sort();
+    failed.dedup();
+    let numbers: Vec<(String, u32)> = failed
+        .iter()
+        .map(|id| {
+            let num = mgr
+                .monitors
+                .iter()
+                .find(|m| &m.id == id)
+                .map(|m| m.display_number)
+                .unwrap_or(0);
+            (id.clone(), num)
+        })
+        .collect();
+
+    let mut still_failing: Vec<u32> = Vec::new();
+    // Re-scanning costs a DDC round trip per display; at most once every 3 s during a drag
+    if last_recovery.elapsed() >= Duration::from_secs(3) {
+        *last_recovery = Instant::now();
+        mgr.refresh();
+        for (id, num) in &numbers {
+            let target = targets.lock().ok().and_then(|m| m.get(id).copied());
+            if !target.map(|t| mgr.set_brightness(id, t)).unwrap_or(false) {
+                still_failing.push(*num);
+            }
+        }
+        // gen 0 keeps the sliders the user is holding; vanished displays drop out of the list
+        publish_snapshot(mgr, cap, 0, shared, hwnd_raw);
+    } else {
+        still_failing = numbers.iter().map(|(_, n)| *n).collect();
+    }
+
+    if still_failing.is_empty() {
+        return;
+    }
+    still_failing.sort_unstable();
+    still_failing.dedup();
+    let msg = match still_failing.as_slice() {
+        [n] if *n > 0 => format!("Display {n} isn't responding"),
+        _ => "A display isn't responding".to_string(),
+    };
+    if let Ok(mut slot) = status.lock() {
+        *slot = Some(msg);
+    }
+    unsafe {
+        let _ = PostMessageW(
+            HWND(hwnd_raw as *mut core::ffi::c_void),
+            WM_WORKER_STATUS,
+            WPARAM(0),
+            LPARAM(0),
+        );
+    }
+}
+
+/// Where the tray icon sits on screen, for opening the flyout without a mouse click.
+fn tray_icon_anchor(hwnd: HWND) -> POINT {
+    unsafe {
+        let id = NOTIFYICONIDENTIFIER {
+            cbSize: std::mem::size_of::<NOTIFYICONIDENTIFIER>() as u32,
+            hWnd: hwnd,
+            uID: TRAY_ICON_ID,
+            ..Default::default()
+        };
+        if let Ok(r) = Shell_NotifyIconGetRect(&id) {
+            if r.right > r.left && r.bottom > r.top {
+                return POINT {
+                    x: (r.left + r.right) / 2,
+                    y: (r.top + r.bottom) / 2,
+                };
+            }
+        }
+        // Icon hidden in the overflow: bottom-right of the primary display, where the tray lives
+        let (work, _) = monitor_work_area_and_dpi_at(POINT { x: 0, y: 0 });
+        POINT {
+            x: work.right - 1,
+            y: work.bottom - 1,
+        }
+    }
+}
+
+/// Precision touchpads send many small wheel deltas per notch. Brightness moves one step per
+/// 120 units of travel, so a touchpad swipe and a mouse notch feel the same.
+/// Returns (steps to apply, leftover travel). Reversing direction drops the leftover.
+fn wheel_steps(accum: i32, delta: i32) -> (i32, i32) {
+    let base = if (accum > 0 && delta < 0) || (accum < 0 && delta > 0) {
+        0
+    } else {
+        accum
+    };
+    let total = base + delta;
+    let steps = total / WHEEL_DELTA;
+    (steps, total - steps * WHEEL_DELTA)
+}
+
+/// Windows reports the current lid state the moment the app registers for lid events, so only
+/// a closed-to-open change counts as "opening the lid".
+fn lid_was_opened(previous: Option<bool>, now_open: bool) -> bool {
+    previous == Some(false) && now_open
+}
+
 unsafe extern "system" fn wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -851,15 +1138,40 @@ unsafe extern "system" fn wnd_proc(
 
     match msg {
         WM_TRAY_ICON => {
+            // Tray clicks while the menu's own message loop runs would open a second menu
+            if state.menu_open {
+                return LRESULT(0);
+            }
             let notif = (lparam.0 & 0xFFFF) as u32;
             match notif {
-                WM_LBUTTONUP | NIN_KEYSELECT => {
-                    state.toggle_flyout();
+                WM_LBUTTONUP => {
+                    let mut cursor = POINT::default();
+                    let _ = GetCursorPos(&mut cursor);
+                    state.toggle_flyout(cursor);
+                }
+                NIN_KEYSELECT => {
+                    // Keyboard (Win+B, Enter): the mouse may be on another screen entirely
+                    state.toggle_flyout(tray_icon_anchor(hwnd));
                 }
                 WM_RBUTTONUP => {
-                    state.show_context_menu();
+                    state.show_context_menu(None);
                 }
                 _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_SHOW_FROM_RELAUNCH => {
+            if state.visible {
+                let _ = SetForegroundWindow(hwnd);
+            } else {
+                state.show_flyout(tray_icon_anchor(hwnd));
+            }
+            LRESULT(0)
+        }
+        WM_WORKER_STATUS => {
+            let msg = state.worker_status.lock().ok().and_then(|mut s| s.take());
+            if let Some(msg) = msg {
+                state.set_error(&msg);
             }
             LRESULT(0)
         }
@@ -922,6 +1234,10 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_AUTO_BRIGHTNESS_RESULT => {
+            // A result that lands after "timed out" was already reported must not move the sliders
+            if !state.measuring_ambient || lparam.0 as u64 != state.ambient_seq {
+                return LRESULT(0);
+            }
             let _ = KillTimer(hwnd, TIMER_AMBIENT_TIMEOUT);
             state.measuring_ambient = false;
             let code = wparam.0;
@@ -956,9 +1272,12 @@ unsafe extern "system" fn wnd_proc(
                 let reason = match code {
                     AMBIENT_RES_CAMERA_IN_USE => "Camera in use",
                     AMBIENT_RES_CAMERA_DENIED => "Camera access off",
+                    // Usually another app holding the camera: newer Windows builds no longer
+                    // record camera use where the in-use check can see it
+                    _ if state.ambient_cap == AmbientCapability::Webcam => "Couldn't open camera",
                     _ => "Sensor unavailable",
                 };
-                state.set_status(reason, 2400);
+                state.set_error(reason);
             }
             if state.visible {
                 state.render();
@@ -1051,7 +1370,7 @@ unsafe extern "system" fn wnd_proc(
                 let _ = KillTimer(hwnd, TIMER_AMBIENT_TIMEOUT);
                 if state.measuring_ambient {
                     state.measuring_ambient = false;
-                    state.set_status("Sensor timed out", 2400);
+                    state.set_error("Sensor timed out");
                 }
             }
             LRESULT(0)
@@ -1061,11 +1380,12 @@ unsafe extern "system" fn wnd_proc(
             let mut should_schedule = evt == PBT_APMRESUMEAUTOMATIC || evt == PBT_APMRESUMESUSPEND;
             if evt == PBT_POWERSETTINGCHANGE && lparam.0 != 0 {
                 let pbs = &*(lparam.0 as *const POWERBROADCAST_SETTING);
-                if pbs.PowerSetting == GUID_LIDSWITCH_STATE_CHANGE
-                    && pbs.DataLength >= 1
-                    && pbs.Data[0] == 1
-                {
-                    should_schedule = true;
+                if pbs.PowerSetting == GUID_LIDSWITCH_STATE_CHANGE && pbs.DataLength >= 1 {
+                    let now_open = pbs.Data[0] != 0;
+                    let previous = state.lid_open.replace(now_open);
+                    if lid_was_opened(previous, now_open) {
+                        should_schedule = true;
+                    }
                 }
             }
             if should_schedule && state.auto_on_wake {
@@ -1079,17 +1399,6 @@ unsafe extern "system" fn wnd_proc(
                 state.render();
             }
             LRESULT(0)
-        }
-        WM_SETCURSOR => {
-            let cursor_id = if state.hover != HoverTarget::None || state.dragging_idx.is_some() {
-                IDC_HAND
-            } else {
-                IDC_ARROW
-            };
-            if let Ok(hcur) = LoadCursorW(None, cursor_id) {
-                SetCursor(hcur);
-            }
-            LRESULT(1)
         }
         WM_ACTIVATE => {
             let active_flag = (wparam.0 & 0xFFFF) as u32;
@@ -1105,52 +1414,62 @@ unsafe extern "system" fn wnd_proc(
             let shift_down = (GetKeyState(0x10) as u16 & 0x8000) != 0;
             match wparam.0 {
                 0x1B => state.hide_flyout(),
-                0x26 => {
-                    // VK_UP
+                0x26 | 0x28 => {
+                    // VK_UP / VK_DOWN move between display cards
                     let count = state.monitors.len();
                     if count > 0 {
+                        let up = wparam.0 == 0x26;
+                        state.focused_btn = None;
                         state.focused_idx = Some(match state.focused_idx {
-                            Some(i) => (i + count - 1) % count,
-                            None => count - 1,
-                        });
-                        state.render();
-                    }
-                }
-                0x28 => {
-                    // VK_DOWN
-                    let count = state.monitors.len();
-                    if count > 0 {
-                        state.focused_idx = Some(match state.focused_idx {
+                            Some(i) if up => (i + count - 1) % count,
                             Some(i) => (i + 1) % count,
+                            None if up => count - 1,
                             None => 0,
                         });
                         state.render();
                     }
                 }
-                0x09 => {
-                    // VK_TAB (or Shift+Tab)
-                    let count = state.monitors.len();
-                    if count > 0 {
-                        state.focused_idx = Some(match state.focused_idx {
-                            Some(i) if shift_down => (i + count - 1) % count,
-                            Some(i) => (i + 1) % count,
-                            None if shift_down => count - 1,
-                            None => 0,
-                        });
+                0x09 => state.cycle_focus(shift_down), // Tab / Shift+Tab: cards, then footer
+                0x0D | 0x20 => {
+                    // Enter / Space press the focused footer button
+                    if let Some(b) = state.focused_btn {
+                        state.invoke_button(b, true);
+                    }
+                }
+                0x5D => {
+                    // Menu (Apps) key opens Settings beside its button
+                    state.focused_idx = None;
+                    state.focused_btn = Some(HoverTarget::SettingsButton);
+                    state.render();
+                    state.invoke_button(HoverTarget::SettingsButton, true);
+                }
+                0x25 | 0x27 if state.focused_btn.is_some() => {
+                    // Left/Right walk the footer like a toolbar
+                    let btns = state.footer_buttons();
+                    if let Some(p) = btns.iter().position(|b| Some(*b) == state.focused_btn) {
+                        let n = btns.len();
+                        let next = if wparam.0 == 0x27 { (p + 1) % n } else { (p + n - 1) % n };
+                        state.focused_btn = Some(btns[next]);
                         state.render();
                     }
                 }
-                0x25 | 0x27 => {
-                    // VK_LEFT / VK_RIGHT
+                0x21 | 0x22 | 0x24 | 0x23 if state.focused_btn.is_some() => {}
+                0x25 | 0x27 | 0x21 | 0x22 | 0x24 | 0x23 => {
+                    // Left/Right step, PageUp/PageDown 10%, Home/End to 0%/100% (WinUI slider keys)
                     if !state.monitors.is_empty() {
-                        let idx = state.focused_idx.unwrap_or(0);
+                        let idx = state.focused_idx.unwrap_or(0).min(state.monitors.len() - 1);
                         state.focused_idx = Some(idx);
                         let step = if shift_down { 1 } else { 5 };
-                        let dir = if wparam.0 == 0x27 { step } else { -step };
                         let cur = state.monitors[idx].brightness as i32;
-                        let next = (cur + dir).clamp(0, 100) as f32;
-                        state.set_monitor_brightness_f32(idx, next, false);
-                        update_tray_tooltip(hwnd, &state.monitors);
+                        let next = match wparam.0 {
+                            0x27 => cur + step,
+                            0x25 => cur - step,
+                            0x21 => cur + 10,
+                            0x22 => cur - 10,
+                            0x24 => 0,
+                            _ => 100,
+                        };
+                        state.nudge_brightness(idx, next);
                     }
                 }
                 0x41 => state.trigger_ambient_measure(), // 'A'
@@ -1215,6 +1534,7 @@ unsafe extern "system" fn wnd_proc(
             let show_auto = state.ambient_cap != AmbientCapability::None;
             let target = hit_test(x, y, state.monitors.len(), total_h, show_auto);
             state.focused_idx = None;
+            state.focused_btn = None;
 
             match target {
                 HoverTarget::Slider(idx) => {
@@ -1230,22 +1550,8 @@ unsafe extern "system" fn wnd_proc(
                     let b = x_to_brightness_f32(x);
                     state.set_monitor_brightness_f32(idx, b, false);
                 }
-                HoverTarget::AutoButton => {
-                    state.trigger_ambient_measure();
-                }
-                HoverTarget::LinkButton => {
-                    state.linked = !state.linked;
-                    write_reg_bool(w!("Linked"), state.linked);
-                    state.render();
-                }
-                HoverTarget::RefreshButton => {
-                    state.ddc_retry_scheduled = false;
-                    state.request_refresh(true);
-                }
-                HoverTarget::SettingsButton => {
-                    state.show_context_menu();
-                }
-                HoverTarget::None => {}
+                HoverTarget::None => state.render(),
+                button => state.invoke_button(button, false),
             }
             LRESULT(0)
         }
@@ -1274,7 +1580,6 @@ unsafe extern "system" fn wnd_proc(
             let delta = ((wparam.0 >> 16) as i16) as i32;
             let shift_down = (GetKeyState(0x10) as u16 & 0x8000) != 0;
             let mag = if shift_down { 1 } else { 5 };
-            let step = if delta > 0 { mag } else { -mag };
 
             let mut pt = POINT {
                 x: ((lparam.0 & 0xFFFF) as i16) as i32,
@@ -1286,11 +1591,18 @@ unsafe extern "system" fn wnd_proc(
             let y = pt.y as f32 / scale;
 
             if let Some(idx) = card_index_at(x, y, state.monitors.len()) {
-                state.focused_idx = None;
-                let cur = state.monitors[idx].brightness as i32;
-                let next = (cur + step).clamp(0, 100) as f32;
-                state.set_monitor_brightness_f32(idx, next, false);
-                update_tray_tooltip(hwnd, &state.monitors);
+                if state.wheel_card != Some(idx) {
+                    state.wheel_card = Some(idx);
+                    state.wheel_accum = 0;
+                }
+                let (steps, rest) = wheel_steps(state.wheel_accum, delta);
+                state.wheel_accum = rest;
+                if steps != 0 {
+                    state.focused_idx = None;
+                    state.focused_btn = None;
+                    let cur = state.monitors[idx].brightness as i32;
+                    state.nudge_brightness(idx, cur + steps * mag);
+                }
             }
             LRESULT(0)
         }
@@ -1516,9 +1828,17 @@ fn format_tray_tooltip(monitors: &[UiMonitor]) -> String {
         return HEADER.to_string();
     }
 
+    // Names carry no number now; add it back only when two displays share a name
+    let label = |m: &UiMonitor| -> String {
+        if monitors.iter().filter(|o| o.name == m.name).count() > 1 {
+            format!("{} ({})", m.name, m.display_number)
+        } else {
+            m.name.clone()
+        }
+    };
     let full_parts: Vec<String> = monitors
         .iter()
-        .map(|m| format!("{}: {}%", m.name, m.brightness))
+        .map(|m| format!("{}: {}%", label(m), m.brightness))
         .collect();
     let full = format!("{}\n{}", HEADER, full_parts.join(" · "));
     if full.encode_utf16().count() <= MAX_CHARS {
@@ -1531,12 +1851,13 @@ fn format_tray_tooltip(monitors: &[UiMonitor]) -> String {
     let per_item_budget = ((MAX_CHARS - HEADER.len() - 1) / max_items).saturating_sub(3);
     for (i, m) in monitors.iter().take(max_items).enumerate() {
         let suffix = format!(": {}%", m.brightness);
+        let name = label(m);
         let name_budget = per_item_budget.saturating_sub(suffix.len());
-        let short_name: String = if m.name.chars().count() > name_budget && name_budget >= 4 {
-            let truncated: String = m.name.chars().take(name_budget - 1).collect();
+        let short_name: String = if name.chars().count() > name_budget && name_budget >= 4 {
+            let truncated: String = name.chars().take(name_budget - 1).collect();
             format!("{}…", truncated.trim_end())
         } else {
-            m.name.chars().take(name_budget).collect()
+            name.chars().take(name_budget).collect()
         };
         let sep = if i == 0 { "\n" } else { " · " };
         let candidate = format!("{}{}{}{}", out, sep, short_name, suffix);
@@ -1587,6 +1908,55 @@ mod tests {
         assert!(tip.encode_utf16().count() <= 127);
         assert!(tip.contains("60%"));
         assert!(tip.contains("70%"));
+    }
+
+    fn mon(n: u32, name: &str, b: u32) -> UiMonitor {
+        UiMonitor {
+            id: format!("id{n}"),
+            display_number: n,
+            name: name.to_string(),
+            brightness: b,
+            visual_brightness: b as f32,
+            anim_from: b as f32,
+        }
+    }
+
+    #[test]
+    fn test_tooltip_numbers_only_twin_displays() {
+        let tip = format_tray_tooltip(&[mon(1, "MAG 27CQ6F", 51), mon(2, "Built-in display", 40)]);
+        assert!(tip.contains("MAG 27CQ6F: 51%"), "{tip}");
+        assert!(tip.contains("Built-in display: 40%"), "{tip}");
+        let twins = format_tray_tooltip(&[mon(2, "DELL U2419H", 30), mon(3, "DELL U2419H", 70)]);
+        assert!(twins.contains("DELL U2419H (2): 30%"), "{twins}");
+        assert!(twins.contains("DELL U2419H (3): 70%"), "{twins}");
+    }
+
+    #[test]
+    fn test_touchpad_scroll_moves_one_step_per_notch() {
+        // Precision touchpad: one notch arrives as 8 events of 15 units
+        let (mut acc, mut total) = (0, 0);
+        for _ in 0..8 {
+            let (steps, rest) = wheel_steps(acc, 15);
+            total += steps;
+            acc = rest;
+        }
+        assert_eq!(total, 1);
+        assert_eq!(acc, 0);
+        // A mouse notch is one event of 120; two notches at once are two steps
+        assert_eq!(wheel_steps(0, 120), (1, 0));
+        assert_eq!(wheel_steps(0, -240), (-2, 0));
+        // Turning back drops leftover travel instead of eating the first notch back
+        assert_eq!(wheel_steps(90, -120), (-1, 0));
+        assert_eq!(wheel_steps(-60, 30), (0, 30));
+    }
+
+    #[test]
+    fn test_lid_open_needs_a_real_change() {
+        // Windows reports "open" on registration; that is not a lid opening
+        assert!(!lid_was_opened(None, true));
+        assert!(!lid_was_opened(Some(true), true));
+        assert!(!lid_was_opened(Some(true), false));
+        assert!(lid_was_opened(Some(false), true));
     }
 }
 

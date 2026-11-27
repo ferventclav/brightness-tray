@@ -33,8 +33,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, LoadCursorW,
     PostMessageW, RegisterClassW, SetForegroundWindow, SetWindowPos, ShowWindow,
     TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HWND_TOPMOST,
-    IDC_ARROW, IDC_HAND, MSG, SWP_SHOWWINDOW, SW_HIDE, WA_INACTIVE, WM_ACTIVATE, WM_CREATE,
-    WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_SETCURSOR, WNDCLASSW,
+    IDC_ARROW, MSG, SWP_SHOWWINDOW, SW_HIDE, WA_INACTIVE, WM_ACTIVATE, WM_CREATE,
+    WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WNDCLASSW,
     WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
@@ -479,7 +479,16 @@ pub fn show_fluent_menu(
         let _ = SetForegroundWindow(hwnd);
 
         let mut msg = MSG::default();
-        while !state.closed && GetMessageW(&mut msg, None, 0, 0).into() {
+        while !state.closed {
+            let got = GetMessageW(&mut msg, None, 0, 0);
+            if got.0 == 0 {
+                // WM_QUIT belongs to the app's main loop: hand it back so Exit still works
+                windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(msg.wParam.0 as i32);
+                break;
+            }
+            if got.0 == -1 {
+                break;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -511,13 +520,6 @@ unsafe extern "system" fn menu_wnd_proc(
     let state = &mut *ptr;
 
     match msg {
-        WM_SETCURSOR => {
-            let cur = if state.hover_idx.is_some() { IDC_HAND } else { IDC_ARROW };
-            if let Ok(h) = LoadCursorW(None, cur) {
-                windows::Win32::UI::WindowsAndMessaging::SetCursor(h);
-            }
-            LRESULT(1)
-        }
         WM_ACTIVATE => {
             if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE {
                 state.closed = true;

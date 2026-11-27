@@ -45,7 +45,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, SystemParametersInfoW, SPI_GETWORKAREA, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    SystemParametersInfoW, SPI_GETWORKAREA, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
 };
 
 use crate::theme::ThemeColors;
@@ -90,8 +90,14 @@ pub struct RenderState<'a> {
     pub refresh_angle: f32,
     pub show_auto: bool,
     pub footer_hint: Option<&'a str>,
+    /// Errors read in primary text so they don't pass for a hover hint
+    pub footer_hint_strong: bool,
+    pub focused_btn: Option<HoverTarget>,
     pub dpi: f32,
 }
+
+/// WinUI ControlCornerRadius: cards and buttons. The window itself keeps the 8 DIP overlay radius.
+const CONTROL_RADIUS: f32 = 4.0;
 
 pub fn monitor_work_area_and_dpi_at(pt: POINT) -> (RECT, u32) {
     unsafe {
@@ -166,14 +172,12 @@ pub fn compute_flyout_height_dip(monitor_count: usize) -> f32 {
     OUTER_PAD + cards * CARD_HEIGHT + gaps * CARD_GAP + OUTER_PAD + TOOLBAR_HEIGHT
 }
 
-pub fn compute_flyout_position(width_px: i32, height_px: i32, dpi: u32) -> (i32, i32) {
-    let mut cursor = POINT::default();
-    let has_cursor = unsafe { GetCursorPos(&mut cursor).is_ok() };
-    let (work_area, _) = monitor_work_area_and_dpi_at(cursor);
+pub fn compute_flyout_position(anchor: POINT, width_px: i32, height_px: i32, dpi: u32) -> (i32, i32) {
+    let (work_area, _) = monitor_work_area_and_dpi_at(anchor);
 
     let margin = ((12.0 * dpi as f32) / 96.0).round() as i32;
-    let x = if has_cursor && cursor.x >= work_area.left && cursor.x <= work_area.right {
-        (cursor.x - width_px / 2)
+    let x = if anchor.x >= work_area.left && anchor.x <= work_area.right {
+        (anchor.x - width_px / 2)
             .max(work_area.left + margin)
             .min(work_area.right - width_px - margin)
     } else {
@@ -205,8 +209,9 @@ pub fn card_index_at(x: f32, y: f32, count: usize) -> Option<usize> {
 }
 
 pub fn button_rects(total_height_dip: f32, show_auto: bool) -> Vec<(HoverTarget, D2D_RECT_F)> {
+    // 32 DIP is the Windows minimum hit target
     let btn_w = 36.0;
-    let btn_h = 30.0;
+    let btn_h = 32.0;
     let gap = 6.0;
     let top = total_height_dip - TOOLBAR_HEIGHT + (TOOLBAR_HEIGHT - btn_h) / 2.0;
     let right_edge = FLYOUT_WIDTH_DIP - OUTER_PAD;
@@ -361,6 +366,7 @@ pub struct Renderer {
     font_small: IDWriteTextFormat,
     font_button: IDWriteTextFormat,
     font_status: IDWriteTextFormat,
+    font_note: IDWriteTextFormat,
     font_badge: IDWriteTextFormat,
     width_px: u32,
     height_px: u32,
@@ -489,6 +495,19 @@ impl Renderer {
                 );
             }
 
+            // Left-aligned secondary line for the empty state, under a left-aligned title
+            let font_note = dwrite_factory.CreateTextFormat(
+                w!("Segoe UI Variable Text"),
+                None,
+                DWRITE_FONT_WEIGHT_REGULAR,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                12.0,
+                w!("en-US"),
+            )?;
+            font_note.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
+            font_note.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+
             let font_badge = dwrite_factory.CreateTextFormat(
                 w!("Segoe UI Variable Text"),
                 None,
@@ -514,6 +533,7 @@ impl Renderer {
                 font_small,
                 font_button,
                 font_status,
+                font_note,
                 font_badge,
                 width_px,
                 height_px,
@@ -605,13 +625,13 @@ impl Renderer {
                         right: FLYOUT_WIDTH_DIP - OUTER_PAD,
                         bottom: OUTER_PAD + CARD_HEIGHT,
                     },
-                    radiusX: 8.0,
-                    radiusY: 8.0,
+                    radiusX: CONTROL_RADIUS,
+                    radiusY: CONTROL_RADIUS,
                 };
                 ctx.FillRoundedRectangle(&card_rect, &brush_card);
                 ctx.DrawRoundedRectangle(&card_rect, &brush_card_border, 1.0, None);
 
-                let msg: Vec<u16> = "No controllable displays detected"
+                let msg: Vec<u16> = "No controllable displays found"
                     .encode_utf16()
                     .collect();
                 ctx.DrawText(
@@ -628,12 +648,13 @@ impl Renderer {
                     Default::default(),
                 );
 
-                let sub_msg: Vec<u16> = "Enable DDC/CI in monitor OSD, then click Refresh"
+                // "DDC/CI" stays: it is the exact name of the switch in monitor menus
+                let sub_msg: Vec<u16> = "Turn on DDC/CI in your monitor's menu, then Refresh"
                     .encode_utf16()
                     .collect();
                 ctx.DrawText(
                     &sub_msg,
-                    &self.font_status,
+                    &self.font_note,
                     &D2D_RECT_F {
                         left: OUTER_PAD + 16.0,
                         top: OUTER_PAD + 44.0,
@@ -654,8 +675,8 @@ impl Renderer {
                             right: FLYOUT_WIDTH_DIP - OUTER_PAD,
                             bottom: top + CARD_HEIGHT,
                         },
-                        radiusX: 8.0,
-                        radiusY: 8.0,
+                        radiusX: CONTROL_RADIUS,
+                        radiusY: CONTROL_RADIUS,
                     };
 
                     let is_active = rs.hover == HoverTarget::Slider(i) || rs.dragging_idx == Some(i);
@@ -812,7 +833,7 @@ impl Renderer {
                             right: hint_right,
                             bottom: total_h,
                         },
-                        &brush_text_dim,
+                        if rs.footer_hint_strong { &brush_text } else { &brush_text_dim },
                         Default::default(),
                         Default::default(),
                     );
@@ -847,10 +868,22 @@ impl Renderer {
                     ctx.FillRoundedRectangle(
                         &D2D1_ROUNDED_RECT {
                             rect: r,
-                            radiusX: 6.0,
-                            radiusY: 6.0,
+                            radiusX: CONTROL_RADIUS,
+                            radiusY: CONTROL_RADIUS,
                         },
                         &b,
+                    );
+                }
+                if rs.focused_btn == Some(target) {
+                    ctx.DrawRoundedRectangle(
+                        &D2D1_ROUNDED_RECT {
+                            rect: r,
+                            radiusX: CONTROL_RADIUS,
+                            radiusY: CONTROL_RADIUS,
+                        },
+                        &brush_focus,
+                        1.5,
+                        None,
                     );
                 }
 
