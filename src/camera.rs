@@ -1,29 +1,190 @@
+use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
-use windows::core::{w, Interface};
+use windows::core::{implement, s, w, Interface, HRESULT};
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Media::DirectShow::{CameraControl_Exposure, IAMCameraControl};
 use windows::Win32::Media::MediaFoundation::{
-    IMFActivate, IMFMediaBuffer, IMFMediaSource, IMFSample, IMFSourceReader, MFCreateAttributes,
-    MFCreateMediaType, MFCreateSourceReaderFromMediaSource, MFEnumDeviceSources, MFShutdown,
-    MFStartup, MFVideoFormat_RGB32, MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME,
-    MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
-    MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
-    MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_VERSION,
-    MFMediaType_Video, MFSTARTUP_NOSOCKET,
+    IMFActivate, IMFMediaBuffer, IMFMediaSource, IMFSample, IMFSensorActivitiesReport,
+    IMFSensorActivitiesReportCallback, IMFSensorActivitiesReportCallback_Impl,
+    IMFSensorActivityMonitor, IMFSourceReader, MFCreateAttributes, MFCreateMediaType,
+    MFCreateSourceReaderFromMediaSource, MFEnumDeviceSources, MFShutdown, MFStartup,
+    MFVideoFormat_RGB32, MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
+    MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
+    MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE,
+    MF_MT_SUBTYPE, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+    MF_VERSION, MFMediaType_Video, MFSTARTUP_NOSOCKET,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
+use windows::Win32::System::LibraryLoader::{
+    GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
+};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER,
     KEY_READ, REG_QWORD, REG_SZ,
 };
+use windows::Win32::System::Threading::GetCurrentProcessId;
 
 use crate::ambient::AmbientResult;
 
-/// Checks Windows CapabilityAccessManager ConsentStore to see if any app currently
-/// has the webcam open (`LastUsedTimeStop == 0`). If so, we must not touch the camera.
-fn is_camera_in_use_by_other_app() -> bool {
+/// Reports whether another app is streaming from the camera at `camera_link` (any camera
+/// when the link is unknown), so Auto never fights it for the device. Uses Media
+/// Foundation's sensor activity monitor (needs MFStartup). Falls back to the
+/// CapabilityAccessManager ConsentStore when the monitor is missing or silent; recent
+/// Windows 11 builds stopped updating that store, so it is only a fallback.
+unsafe fn is_camera_in_use_by_other_app(camera_link: Option<&str>) -> bool {
+    match sensor_monitor_says_in_use(camera_link) {
+        Some(busy) => busy,
+        None => consent_store_says_in_use(),
+    }
+}
+
+/// ConsentStore check: some app has the webcam open when `LastUsedTimeStop == 0`.
+fn consent_store_says_in_use() -> bool {
     unsafe { check_consent_subkey(w!(r"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\webcam")) }
+}
+
+/// Quiet gap after the last report before the monitor's answer counts as settled.
+/// On build 26300 the current state arrives about 0.3 ms after Start(), as two reports
+/// (the first one empty), and nothing more comes until something changes.
+const MONITOR_SETTLE: Duration = Duration::from_millis(50);
+/// Longest wait for any report; past this the monitor counts as unavailable.
+const MONITOR_TIMEOUT: Duration = Duration::from_millis(300);
+
+type CreateMonitorFn = unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT;
+
+/// Looks up MFCreateSensorActivityMonitor at run time, so the app still starts on Windows
+/// builds whose mfsensorgroup.dll lacks it (a static import would stop it loading).
+fn create_monitor_fn() -> Option<CreateMonitorFn> {
+    static CREATE: OnceLock<Option<CreateMonitorFn>> = OnceLock::new();
+    *CREATE.get_or_init(|| unsafe {
+        let module = LoadLibraryExW(
+            w!("mfsensorgroup.dll"),
+            HANDLE::default(),
+            LOAD_LIBRARY_SEARCH_SYSTEM32,
+        )
+        .ok()?;
+        let proc = GetProcAddress(module, s!("MFCreateSensorActivityMonitor"))?;
+        Some(std::mem::transmute::<unsafe extern "system" fn() -> isize, CreateMonitorFn>(proc))
+    })
+}
+
+#[derive(Default)]
+struct ActivityState {
+    last_report: Option<Instant>,
+    busy: bool,
+}
+
+struct ActivityShared {
+    state: Mutex<ActivityState>,
+    changed: Condvar,
+    camera_link: Option<String>,
+    own_pid: u32,
+}
+
+#[implement(IMFSensorActivitiesReportCallback)]
+struct ActivityCallback {
+    shared: Arc<ActivityShared>,
+}
+
+impl IMFSensorActivitiesReportCallback_Impl for ActivityCallback_Impl {
+    fn OnActivitiesReport(
+        &self,
+        report: Option<&IMFSensorActivitiesReport>,
+    ) -> windows::core::Result<()> {
+        let shared = &self.shared;
+        let busy = report.is_some_and(|r| unsafe {
+            report_shows_other_app(r, shared.camera_link.as_deref(), shared.own_pid)
+        });
+        let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.last_report = Some(Instant::now());
+        state.busy |= busy;
+        drop(state);
+        shared.changed.notify_all();
+        Ok(())
+    }
+}
+
+unsafe fn report_shows_other_app(
+    report: &IMFSensorActivitiesReport,
+    camera_link: Option<&str>,
+    own_pid: u32,
+) -> bool {
+    for i in 0..report.GetCount().unwrap_or(0) {
+        let Ok(device) = report.GetActivityReport(i) else { continue };
+        if let Some(target) = camera_link {
+            let mut buf = [0u16; 1024];
+            let mut written = 0u32;
+            if device.GetSymbolicLink(&mut buf, &mut written).is_err() {
+                continue;
+            }
+            // The monitor reports the same link as enumeration, but upper-cased
+            if !wide_to_string(&buf).eq_ignore_ascii_case(target) {
+                continue;
+            }
+        }
+        for p in 0..device.GetProcessCount().unwrap_or(0) {
+            let Ok(activity) = device.GetProcessActivity(p) else { continue };
+            let streaming = activity.GetStreamingState().map(|s| s.as_bool()).unwrap_or(false);
+            if streaming && activity.GetProcessId().unwrap_or(0) != own_pid {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn wide_to_string(buf: &[u16]) -> String {
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..end])
+}
+
+/// Asks the sensor activity monitor whether another process streams from the camera.
+/// Returns None when the monitor is missing or sends no report within MONITOR_TIMEOUT.
+unsafe fn sensor_monitor_says_in_use(camera_link: Option<&str>) -> Option<bool> {
+    let create = create_monitor_fn()?;
+    let shared = Arc::new(ActivityShared {
+        state: Mutex::new(ActivityState::default()),
+        changed: Condvar::new(),
+        camera_link: camera_link.map(str::to_owned),
+        own_pid: GetCurrentProcessId(),
+    });
+    let callback: IMFSensorActivitiesReportCallback =
+        ActivityCallback { shared: shared.clone() }.into();
+    let mut raw = std::ptr::null_mut();
+    if create(callback.as_raw(), &mut raw).is_err() || raw.is_null() {
+        return None;
+    }
+    let monitor = IMFSensorActivityMonitor::from_raw(raw);
+    if monitor.Start().is_err() {
+        return None;
+    }
+    let started = Instant::now();
+    let give_up = started + MONITOR_TIMEOUT;
+    let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+    let verdict = loop {
+        if state.busy {
+            break Some(true);
+        }
+        let deadline = state
+            .last_report
+            .map_or(give_up, |last| (last + MONITOR_SETTLE).min(give_up));
+        let now = Instant::now();
+        if now >= deadline {
+            break state.last_report.map(|_| false);
+        }
+        state = shared
+            .changed
+            .wait_timeout(state, deadline - now)
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
+    };
+    // Release the lock first: Stop() may wait for a callback that needs it
+    drop(state);
+    let _ = monitor.Stop();
+    verdict
 }
 
 /// Checks if Windows camera privacy access is explicitly denied for desktop apps.
@@ -139,16 +300,11 @@ unsafe fn check_hkey_recursive(hkey: HKEY, depth: u32) -> bool {
 
 /// Measures room ambient light using the default physical webcam in read-only mode
 /// (never taking exclusive control or changing camera settings).
-/// Skips when camera access is denied, or when the ConsentStore shows another app streaming.
-/// Recent Windows 11 builds stopped updating that store, so the in-use check can miss a busy
-/// camera; the open then fails without disturbing the other app and this returns Unavailable.
-/// Shuts down within ~2.8 s of the camera starting.
+/// Skips when camera access is denied or another app is streaming from the camera, so it
+/// never opens a busy camera. Shuts down within ~2.8 s of the camera starting.
 pub fn measure_room_brightness() -> AmbientResult {
     if is_camera_access_denied() {
         return AmbientResult::CameraDenied;
-    }
-    if is_camera_in_use_by_other_app() {
-        return AmbientResult::CameraInUse;
     }
     unsafe {
         if MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET).is_err() {
@@ -156,10 +312,7 @@ pub fn measure_room_brightness() -> AmbientResult {
         }
         let result = measure_inner();
         let _ = MFShutdown();
-        match result {
-            Some(b) => AmbientResult::Brightness(b),
-            None => AmbientResult::Unavailable,
-        }
+        result
     }
 }
 
@@ -190,7 +343,24 @@ pub unsafe fn activate_friendly_name(act: &IMFActivate) -> String {
     }
 }
 
-unsafe fn measure_inner() -> Option<u32> {
+unsafe fn measure_inner() -> AmbientResult {
+    let Some((act, link)) = pick_camera() else {
+        return AmbientResult::Unavailable;
+    };
+    if is_camera_in_use_by_other_app(link.as_deref()) {
+        return AmbientResult::CameraInUse;
+    }
+    let source: Option<IMFMediaSource> = act.ActivateObject().ok();
+    drop(act);
+    match source.and_then(|s| read_brightness(s)) {
+        Some(b) => AmbientResult::Brightness(b),
+        None => AmbientResult::Unavailable,
+    }
+}
+
+/// Picks the camera Auto reads (the first physical one, else the first of any kind) and
+/// returns its activation object and symbolic link.
+unsafe fn pick_camera() -> Option<(IMFActivate, Option<String>)> {
     let mut attrs = None;
     MFCreateAttributes(&mut attrs, 1).ok()?;
     let attrs = attrs?;
@@ -217,16 +387,24 @@ unsafe fn measure_inner() -> Option<u32> {
                 .unwrap_or(false)
         })
         .unwrap_or(0);
-    let source: Option<IMFMediaSource> = devices[preferred_idx]
-        .as_ref()
-        .and_then(|act| act.ActivateObject().ok());
+    let chosen = devices[preferred_idx].clone();
 
     for dev in devices.iter_mut() {
         *dev = None;
     }
     CoTaskMemFree(Some(devices_ptr as *const _));
 
-    let source = source?;
+    let act = chosen?;
+    let mut buf = [0u16; 1024];
+    let mut len = 0u32;
+    let link = act
+        .GetString(&MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, &mut buf, Some(&mut len))
+        .ok()
+        .map(|_| wide_to_string(&buf));
+    Some((act, link))
+}
+
+unsafe fn read_brightness(source: IMFMediaSource) -> Option<u32> {
 
     // Watchdog: if ReadSample stalls for >2.8s, force-shutdown the source so it unblocks and releases immediately
     let finished = Arc::new(AtomicBool::new(false));
@@ -438,8 +616,21 @@ mod tests {
 
     #[test]
     fn test_consent_store_check() {
-        let _ = is_camera_in_use_by_other_app();
+        let _ = consent_store_says_in_use();
         let _ = is_camera_access_denied();
+    }
+
+    #[test]
+    fn test_sensor_monitor_answers_quickly() {
+        unsafe {
+            let _ = MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET);
+            let started = Instant::now();
+            let verdict = sensor_monitor_says_in_use(None);
+            let took = started.elapsed();
+            let _ = MFShutdown();
+            println!("monitor={verdict:?} in {} ms", took.as_millis());
+            assert!(took < MONITOR_TIMEOUT + Duration::from_millis(100));
+        }
     }
 
     #[test]
@@ -453,7 +644,20 @@ mod tests {
     #[test]
     #[ignore = "Live webcam hardware diagnostic"]
     fn test_camera_live_probe() {
-        println!("in_use={}", is_camera_in_use_by_other_app());
+        let in_use = unsafe {
+            let _ = MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET);
+            let link = pick_camera().and_then(|(_, link)| link);
+            let started = Instant::now();
+            let monitor = sensor_monitor_says_in_use(link.as_deref());
+            println!("camera={link:?}");
+            println!("monitor={monitor:?} in {} ms", started.elapsed().as_millis());
+            println!("monitor(other camera)={:?}", sensor_monitor_says_in_use(Some("no-such-camera")));
+            println!("consent_store={}", consent_store_says_in_use());
+            let in_use = is_camera_in_use_by_other_app(link.as_deref());
+            let _ = MFShutdown();
+            in_use
+        };
+        println!("in_use={in_use}");
         println!("measure={:?}", measure_room_brightness());
     }
 }

@@ -33,13 +33,17 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, LoadCursorW,
     PostMessageW, RegisterClassW, SetForegroundWindow, SetWindowPos, ShowWindow,
     TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HWND_TOPMOST,
-    IDC_ARROW, MSG, SWP_SHOWWINDOW, SW_HIDE, WA_INACTIVE, WM_ACTIVATE, WM_CREATE,
-    WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WNDCLASSW,
+    IDC_ARROW, MSG, SWP_SHOWWINDOW, SW_HIDE, WA_INACTIVE, WM_ACTIVATE, WM_CREATE, WM_DESTROY,
+    WM_GETOBJECT, WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WNDCLASSW,
     WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::theme::ThemeColors;
 use crate::ui::{apply_win11_backdrop, create_d3d11_device, monitor_work_area_and_dpi_at};
+use crate::uia::{
+    build_menu_items, is_screen_reader_active, is_uia_getobject, return_raw_provider, MenuUia,
+    WM_UIA_MENU_FOCUS, WM_UIA_MENU_INVOKE,
+};
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const MENU_WIDTH_DIP: f32 = 256.0;
@@ -63,6 +67,7 @@ struct MenuState {
     entries: Vec<MenuEntry>,
     theme: ThemeColors,
     hover_idx: Option<usize>,
+    keyboard_focus: bool,
     selected_id: Option<usize>,
     closed: bool,
     tracking_mouse: bool,
@@ -76,6 +81,31 @@ struct MenuState {
     font_icon: IDWriteTextFormat,
     font_check: IDWriteTextFormat,
     total_h_dip: f32,
+    uia: MenuUia,
+}
+
+fn menu_item_rect(entries: &[MenuEntry], target_idx: usize) -> Option<D2D_RECT_F> {
+    let mut y = MENU_PAD;
+    for (i, entry) in entries.iter().enumerate() {
+        match entry {
+            MenuEntry::Item { .. } => {
+                let r = D2D_RECT_F {
+                    left: MENU_PAD,
+                    top: y,
+                    right: MENU_WIDTH_DIP - MENU_PAD,
+                    bottom: y + ITEM_HEIGHT,
+                };
+                if i == target_idx {
+                    return Some(r);
+                }
+                y += ITEM_HEIGHT;
+            }
+            MenuEntry::Separator => {
+                y += SEP_HEIGHT;
+            }
+        }
+    }
+    None
 }
 
 impl MenuState {
@@ -87,27 +117,7 @@ impl MenuState {
     }
 
     fn item_rect(&self, target_idx: usize) -> Option<D2D_RECT_F> {
-        let mut y = MENU_PAD;
-        for (i, entry) in self.entries.iter().enumerate() {
-            match entry {
-                MenuEntry::Item { .. } => {
-                    let r = D2D_RECT_F {
-                        left: MENU_PAD,
-                        top: y,
-                        right: MENU_WIDTH_DIP - MENU_PAD,
-                        bottom: y + ITEM_HEIGHT,
-                    };
-                    if i == target_idx {
-                        return Some(r);
-                    }
-                    y += ITEM_HEIGHT;
-                }
-                MenuEntry::Separator => {
-                    y += SEP_HEIGHT;
-                }
-            }
-        }
-        None
+        menu_item_rect(&self.entries, target_idx)
     }
 
     fn hit_test(&self, x: f32, y: f32) -> Option<usize> {
@@ -144,7 +154,7 @@ impl MenuState {
                 let _ = ctx.EndDraw(None, None);
                 return;
             };
-            let Ok(_brush_accent) = rt.CreateSolidColorBrush(&self.theme.accent, None) else {
+            let Ok(brush_accent) = rt.CreateSolidColorBrush(&self.theme.accent, None) else {
                 let _ = ctx.EndDraw(None, None);
                 return;
             };
@@ -152,19 +162,12 @@ impl MenuState {
                 let _ = ctx.EndDraw(None, None);
                 return;
             };
-            let border_color = D2D1_COLOR_F {
-                r: self.theme.window_border.r,
-                g: self.theme.window_border.g,
-                b: self.theme.window_border.b,
-                a: 0.045,
-            };
-            let Ok(brush_border) = rt.CreateSolidColorBrush(&border_color, None) else {
+            let Ok(brush_border) = rt.CreateSolidColorBrush(&self.theme.window_border, None) else {
                 let _ = ctx.EndDraw(None, None);
                 return;
             };
 
             let mut y = MENU_PAD;
-            let total_entries = self.entries.len();
             for (i, entry) in self.entries.iter().enumerate() {
                 match entry {
                     MenuEntry::Item { label, glyph, checked, .. } => {
@@ -175,14 +178,15 @@ impl MenuState {
                             bottom: y + ITEM_HEIGHT,
                         };
                         if self.hover_idx == Some(i) {
-                            ctx.FillRoundedRectangle(
-                                &D2D1_ROUNDED_RECT {
-                                    rect: r,
-                                    radiusX: 5.0,
-                                    radiusY: 5.0,
-                                },
-                                &brush_hover,
-                            );
+                            let rr = D2D1_ROUNDED_RECT {
+                                rect: r,
+                                radiusX: 4.0,
+                                radiusY: 4.0,
+                            };
+                            ctx.FillRoundedRectangle(&rr, &brush_hover);
+                            if self.keyboard_focus {
+                                ctx.DrawRoundedRectangle(&rr, &brush_accent, 1.5, None);
+                            }
                         }
 
                         // Left icon (16px Fluent icon)
@@ -235,21 +239,11 @@ impl MenuState {
                             );
                         }
                         y += ITEM_HEIGHT;
-                        // Subtle 1px divider between rows (matching Win11 Network/Sound menus)
-                        if i + 1 < total_entries && !matches!(self.entries[i + 1], MenuEntry::Separator) {
-                            ctx.DrawLine(
-                                D2D_POINT_2F { x: 0.0, y },
-                                D2D_POINT_2F { x: MENU_WIDTH_DIP, y },
-                                &brush_div,
-                                1.0,
-                                None,
-                            );
-                        }
                     }
                     MenuEntry::Separator => {
                         ctx.DrawLine(
-                            D2D_POINT_2F { x: 0.0, y },
-                            D2D_POINT_2F { x: MENU_WIDTH_DIP, y },
+                            D2D_POINT_2F { x: MENU_PAD + 8.0, y },
+                            D2D_POINT_2F { x: MENU_WIDTH_DIP - MENU_PAD - 8.0, y },
                             &brush_div,
                             1.0,
                             None,
@@ -420,9 +414,10 @@ pub fn show_fluent_menu(
             windows::Win32::Graphics::DirectWrite::DWRITE_WORD_WRAPPING_NO_WRAP,
         );
 
+        let icon_family = crate::ui::icon_font_family(&dwrite);
         let font_icon = dwrite
             .CreateTextFormat(
-                w!("Segoe Fluent Icons"),
+                icon_family,
                 None,
                 DWRITE_FONT_WEIGHT_REGULAR,
                 DWRITE_FONT_STYLE_NORMAL,
@@ -436,7 +431,7 @@ pub fn show_fluent_menu(
 
         let font_check = dwrite
             .CreateTextFormat(
-                w!("Segoe Fluent Icons"),
+                icon_family,
                 None,
                 DWRITE_FONT_WEIGHT_REGULAR,
                 DWRITE_FONT_STYLE_NORMAL,
@@ -448,11 +443,22 @@ pub fn show_fluent_menu(
         let _ = font_check.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         let _ = font_check.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 
+        let initial_hover = if is_screen_reader_active() {
+            move_menu_selection(&entries, None, 1)
+        } else {
+            None
+        };
+        let uia_items = build_menu_items(&entries, |idx| {
+            menu_item_rect(&entries, idx).map(|r| (r.left, r.top, r.right, r.bottom))
+        });
+        let uia = MenuUia::new(hwnd, dpi, MENU_WIDTH_DIP, total_h_dip, uia_items);
+
         let mut state = Box::new(MenuState {
             hwnd,
             entries,
             theme,
-            hover_idx: None,
+            hover_idx: initial_hover,
+            keyboard_focus: initial_hover.is_some(),
             selected_id: None,
             closed: false,
             tracking_mouse: false,
@@ -466,6 +472,7 @@ pub fn show_fluent_menu(
             font_icon,
             font_check,
             total_h_dip,
+            uia,
         });
 
         windows::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(
@@ -477,6 +484,10 @@ pub fn show_fluent_menu(
         state.render();
         let _ = SetWindowPos(hwnd, HWND_TOPMOST, x, y, w_px, h_px, SWP_SHOWWINDOW);
         let _ = SetForegroundWindow(hwnd);
+        state.uia.raise_opened();
+        if state.hover_idx.is_some() {
+            state.uia.sync_focus(dpi, state.hover_idx);
+        }
 
         let mut msg = MSG::default();
         while !state.closed {
@@ -493,6 +504,9 @@ pub fn show_fluent_menu(
             DispatchMessageW(&msg);
         }
 
+        state.uia.raise_closed();
+        let _ = return_raw_provider(hwnd, WPARAM(0), LPARAM(0), None);
+        state.uia.disconnect();
         let _ = ShowWindow(hwnd, SW_HIDE);
         let _ = DestroyWindow(hwnd);
         let _ = PostMessageW(parent, windows::Win32::UI::WindowsAndMessaging::WM_NULL, WPARAM(0), LPARAM(0));
@@ -535,17 +549,41 @@ unsafe extern "system" fn menu_wnd_proc(
                 0x26 => {
                     // VK_UP
                     let next = move_menu_selection(&state.entries, state.hover_idx, -1);
-                    if next != state.hover_idx {
+                    if next != state.hover_idx || !state.keyboard_focus {
                         state.hover_idx = next;
+                        state.keyboard_focus = true;
                         state.render();
+                        state.uia.sync_focus(state.dpi(), state.hover_idx);
                     }
                 }
                 0x28 => {
                     // VK_DOWN
                     let next = move_menu_selection(&state.entries, state.hover_idx, 1);
-                    if next != state.hover_idx {
+                    if next != state.hover_idx || !state.keyboard_focus {
                         state.hover_idx = next;
+                        state.keyboard_focus = true;
                         state.render();
+                        state.uia.sync_focus(state.dpi(), state.hover_idx);
+                    }
+                }
+                0x24 => {
+                    // VK_HOME
+                    let next = move_menu_selection(&state.entries, None, 1);
+                    if next != state.hover_idx || !state.keyboard_focus {
+                        state.hover_idx = next;
+                        state.keyboard_focus = true;
+                        state.render();
+                        state.uia.sync_focus(state.dpi(), state.hover_idx);
+                    }
+                }
+                0x23 => {
+                    // VK_END
+                    let next = move_menu_selection(&state.entries, None, -1);
+                    if next != state.hover_idx || !state.keyboard_focus {
+                        state.hover_idx = next;
+                        state.keyboard_focus = true;
+                        state.render();
+                        state.uia.sync_focus(state.dpi(), state.hover_idx);
                     }
                 }
                 0x0D | 0x20 => {
@@ -576,17 +614,20 @@ unsafe extern "system" fn menu_wnd_proc(
             let x = ((lparam.0 & 0xFFFF) as i16) as f32 / scale;
             let y = (((lparam.0 >> 16) & 0xFFFF) as i16) as f32 / scale;
             let new_hover = state.hit_test(x, y);
-            if new_hover != state.hover_idx {
+            if new_hover != state.hover_idx || state.keyboard_focus {
                 state.hover_idx = new_hover;
+                state.keyboard_focus = false;
                 state.render();
+                state.uia.sync_focus(state.dpi(), state.hover_idx);
             }
             LRESULT(0)
         }
         WM_MOUSELEAVE => {
             state.tracking_mouse = false;
-            if state.hover_idx.is_some() {
+            if !state.keyboard_focus && state.hover_idx.is_some() {
                 state.hover_idx = None;
                 state.render();
+                state.uia.sync_focus(state.dpi(), state.hover_idx);
             }
             LRESULT(0)
         }
@@ -606,6 +647,41 @@ unsafe extern "system" fn menu_wnd_proc(
             let mut ps = windows::Win32::Graphics::Gdi::PAINTSTRUCT::default();
             let _ = windows::Win32::Graphics::Gdi::BeginPaint(hwnd, &mut ps);
             let _ = windows::Win32::Graphics::Gdi::EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        WM_GETOBJECT => {
+            if is_uia_getobject(lparam) {
+                let root = state.uia.root_for_hwnd().clone();
+                return return_raw_provider(hwnd, wparam, lparam, Some(&root));
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_UIA_MENU_INVOKE => {
+            let cmd_id = wparam.0;
+            if state
+                .entries
+                .iter()
+                .any(|e| matches!(e, MenuEntry::Item { id, .. } if *id == cmd_id))
+            {
+                state.selected_id = Some(cmd_id);
+                state.closed = true;
+            }
+            LRESULT(0)
+        }
+        WM_UIA_MENU_FOCUS => {
+            let entry_idx = wparam.0;
+            if matches!(state.entries.get(entry_idx), Some(MenuEntry::Item { .. }))
+                && (state.hover_idx != Some(entry_idx) || !state.keyboard_focus)
+            {
+                state.hover_idx = Some(entry_idx);
+                state.keyboard_focus = true;
+                state.render();
+                state.uia.sync_focus(state.dpi(), state.hover_idx);
+            }
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            let _ = return_raw_provider(hwnd, WPARAM(0), LPARAM(0), None);
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),

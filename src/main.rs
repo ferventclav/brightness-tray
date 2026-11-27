@@ -7,6 +7,7 @@ mod monitors;
 mod startup;
 mod theme;
 mod ui;
+mod uia;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -56,11 +57,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetTimer, SetWindowPos, ShowWindow, TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
     HICON, HWND_TOPMOST, ICONINFO, IDC_ARROW, MSG, SM_CXSMICON, SWP_NOACTIVATE, SWP_SHOWWINDOW,
     SW_HIDE, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CAPTURECHANGED, WM_COMMAND, WM_CREATE,
-    WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_POWERBROADCAST, WM_RBUTTONUP, WM_SETTINGCHANGE,
-    WM_TIMER, DEVICE_NOTIFY_WINDOW_HANDLE, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND,
-    PBT_POWERSETTINGCHANGE, WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP,
+    WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_GETOBJECT, WM_KEYDOWN, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_POWERBROADCAST, WM_RBUTTONUP,
+    WM_SETTINGCHANGE, WM_TIMER, DEVICE_NOTIFY_WINDOW_HANDLE, PBT_APMRESUMEAUTOMATIC,
+    PBT_APMRESUMESUSPEND, PBT_POWERSETTINGCHANGE, WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use ambient::{AmbientCapability, AmbientResult};
@@ -71,6 +72,7 @@ use ui::{
     hit_test, monitor_work_area_and_dpi_at, x_to_brightness_f32, HoverTarget, RenderState,
     Renderer, UiMonitor, FLYOUT_WIDTH_DIP,
 };
+use uia::{decode_action, FlyoutUia, UiaAction, WM_UIA_ACTION};
 
 const WM_TRAY_ICON: u32 = WM_APP + 1;
 const WM_MONITORS_UPDATED: u32 = WM_APP + 2;
@@ -158,6 +160,7 @@ struct AppState {
     ambient_seq: u64,
     ambient_busy: Arc<AtomicBool>,
     worker_status: Arc<Mutex<Option<String>>>,
+    uia: FlyoutUia,
 }
 
 impl AppState {
@@ -208,24 +211,40 @@ impl AppState {
         self.status_is_error && self.status_msg.is_some() && !self.measuring_ambient && !self.refreshing
     }
 
-    fn set_status(&mut self, msg: &str, duration_ms: u32) {
+    fn show_status(&mut self, msg: &str, duration_ms: u32, is_error: bool) {
         self.status_msg = Some(msg.to_string());
-        self.status_is_error = false;
+        self.status_is_error = is_error;
         unsafe {
             let _ = SetTimer(self.hwnd, TIMER_STATUS_CLEAR, duration_ms, None);
         }
         if self.visible {
             self.render();
+            self.uia.notify(msg, is_error);
         }
+    }
+
+    fn set_status(&mut self, msg: &str, duration_ms: u32) {
+        self.show_status(msg, duration_ms, false);
     }
 
     /// Something the user asked for did not happen: primary text, and long enough to read.
     fn set_error(&mut self, msg: &str) {
-        self.set_status(msg, 4500);
-        self.status_is_error = true;
-        if self.visible {
-            self.render();
-        }
+        self.show_status(msg, 4500, true);
+    }
+
+    fn sync_uia(&mut self) {
+        let dpi = self.dpi();
+        self.uia.sync(
+            self.hwnd,
+            self.visible,
+            dpi,
+            &self.monitors,
+            self.ambient_cap != AmbientCapability::None,
+            self.linked,
+            self.measuring_ambient,
+            self.focused_idx,
+            self.focused_btn,
+        );
     }
 
     fn footer_buttons(&self) -> Vec<HoverTarget> {
@@ -236,11 +255,25 @@ impl AppState {
             .collect()
     }
 
-    /// Tab order: each display card, then the footer buttons left to right, then around again.
+    fn button_enabled(&self, target: HoverTarget) -> bool {
+        match target {
+            HoverTarget::AutoButton => !self.monitors.is_empty(),
+            HoverTarget::LinkButton => self.monitors.len() > 1,
+            HoverTarget::RefreshButton | HoverTarget::SettingsButton => true,
+            _ => false,
+        }
+    }
+
+    /// Tab order: each display card, then enabled footer buttons left to right, then around again.
     fn cycle_focus(&mut self, backwards: bool) {
         let mut order: Vec<(Option<usize>, Option<HoverTarget>)> =
             (0..self.monitors.len()).map(|i| (Some(i), None)).collect();
-        order.extend(self.footer_buttons().into_iter().map(|b| (None, Some(b))));
+        order.extend(
+            self.footer_buttons()
+                .into_iter()
+                .filter(|&b| self.button_enabled(b))
+                .map(|b| (None, Some(b))),
+        );
         let n = order.len();
         if n == 0 {
             return;
@@ -277,12 +310,20 @@ impl AppState {
     }
 
     fn invoke_button(&mut self, target: HoverTarget, from_keyboard: bool) {
+        if !self.button_enabled(target) {
+            return;
+        }
         match target {
             HoverTarget::AutoButton => self.trigger_ambient_measure(),
             HoverTarget::LinkButton => {
                 self.linked = !self.linked;
                 write_reg_bool(w!("Linked"), self.linked);
-                self.render();
+                let msg = if self.linked {
+                    "Displays linked (L)"
+                } else {
+                    "Displays unlinked (L)"
+                };
+                self.set_status(msg, 1800);
             }
             HoverTarget::RefreshButton => {
                 self.ddc_retry_scheduled = false;
@@ -330,6 +371,7 @@ impl AppState {
                 let _ = r.render(&rs);
             }
         }
+        self.sync_uia();
     }
 
     fn request_refresh(&mut self, animate_icon: bool) {
@@ -341,11 +383,15 @@ impl AppState {
                 let _ = SetTimer(self.hwnd, TIMER_REFRESH_ANIM, 16, None);
             }
             self.render();
+            self.uia.notify("Refreshing displays", false);
         }
     }
 
     fn trigger_ambient_measure(&mut self) {
-        if self.ambient_cap == AmbientCapability::None || self.measuring_ambient {
+        if self.ambient_cap == AmbientCapability::None
+            || self.monitors.is_empty()
+            || self.measuring_ambient
+        {
             return;
         }
         // A measurement that timed out can still be holding the camera; never start a second one.
@@ -386,6 +432,7 @@ impl AppState {
         });
         if self.visible {
             self.render();
+            self.uia.notify("Sampling room light", false);
         }
     }
 
@@ -425,9 +472,23 @@ impl AppState {
     fn show_flyout(&mut self, anchor: POINT) {
         self.theme = ThemeColors::load();
         apply_win11_backdrop(self.hwnd, self.theme.is_dark);
-        self.focused_idx = None;
-        self.focused_btn = None;
+        if uia::is_screen_reader_active() {
+            if !self.monitors.is_empty() {
+                self.focused_idx = Some(0);
+                self.focused_btn = None;
+            } else {
+                self.focused_idx = None;
+                self.focused_btn = self
+                    .footer_buttons()
+                    .into_iter()
+                    .find(|&b| self.button_enabled(b));
+            }
+        } else {
+            self.focused_idx = None;
+            self.focused_btn = None;
+        }
         self.status_msg = None;
+        self.status_is_error = false;
         self.wheel_accum = 0;
         self.wheel_card = None;
         self.request_refresh(false);
@@ -439,6 +500,10 @@ impl AppState {
         if let Some(r) = &mut self.renderer {
             let _ = r.resize(w, h, target_dpi as f32);
         }
+        // Mark visible and sync UIA before SetForegroundWindow so screen readers never see an offscreen 0x0 pane
+        self.visible = true;
+        self.last_show_time = Instant::now();
+        self.render();
         unsafe {
             let _ = SetWindowPos(
                 self.hwnd,
@@ -451,7 +516,7 @@ impl AppState {
             );
             let _ = SetForegroundWindow(self.hwnd);
         }
-        // Re-render after SetWindowPos so DPI matches the destination monitor
+        // Re-render after SetWindowPos so DPI and screen bounds match the destination monitor
         let actual_dpi = self.dpi();
         if actual_dpi != target_dpi {
             let (aw, ah) = self.size_px_for_dpi(actual_dpi);
@@ -460,8 +525,6 @@ impl AppState {
             }
         }
         self.render();
-        self.visible = true;
-        self.last_show_time = Instant::now();
     }
 
     fn hide_flyout(&mut self) {
@@ -475,6 +538,7 @@ impl AppState {
             self.refreshing = false;
             self.refresh_angle = 0.0;
             self.status_msg = None;
+            self.status_is_error = false;
             self.last_hide_time = Instant::now();
             unsafe {
                 let _ = KillTimer(self.hwnd, TIMER_REFRESH_ANIM);
@@ -482,6 +546,7 @@ impl AppState {
                 let _ = ReleaseCapture();
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
             }
+            self.sync_uia();
         }
     }
 
@@ -760,6 +825,7 @@ fn main() {
             ambient_seq: 0,
             ambient_busy: Arc::new(AtomicBool::new(false)),
             worker_status: worker_status.clone(),
+            uia: FlyoutUia::new(HWND::default()),
         });
 
         let state_ptr = &mut *state as *mut AppState;
@@ -781,6 +847,7 @@ fn main() {
         .expect("CreateWindowExW failed");
 
         state.hwnd = hwnd;
+        state.uia = FlyoutUia::new(hwnd);
         apply_win11_backdrop(hwnd, state.theme.is_dark);
         let (w, h) = state.size_px_for_dpi(state.dpi());
         state.renderer = Renderer::new(hwnd, w, h, state.dpi() as f32).ok();
@@ -944,6 +1011,8 @@ fn main() {
 
         state.abort_ramp.store(true, Ordering::Release);
         let _ = worker_tx.send(WorkerCmd::Shutdown);
+        let _ = uia::return_raw_provider(hwnd, WPARAM(0), LPARAM(0), None);
+        uia::disconnect_all_providers();
         remove_tray_icon(hwnd);
         if !state.tray_icon.is_invalid() {
             let _ = DestroyIcon(state.tray_icon);
@@ -1220,15 +1289,35 @@ unsafe extern "system" fn wnd_proc(
                 if let Some(f) = state.focused_idx {
                     if state.monitors.is_empty() {
                         state.focused_idx = None;
+                        if state.visible && state.focused_btn.is_none() {
+                            state.focused_btn = state
+                                .footer_buttons()
+                                .into_iter()
+                                .find(|&b| state.button_enabled(b));
+                        }
                     } else if f >= state.monitors.len() {
                         state.focused_idx = Some(state.monitors.len() - 1);
                     }
+                } else if let Some(b) = state.focused_btn {
+                    if !state.button_enabled(b) {
+                        state.focused_btn = state
+                            .footer_buttons()
+                            .into_iter()
+                            .find(|&btn| state.button_enabled(btn));
+                    }
+                } else if state.visible
+                    && !state.monitors.is_empty()
+                    && uia::is_screen_reader_active()
+                {
+                    state.focused_idx = Some(0);
                 }
 
                 update_tray_tooltip(hwnd, &state.monitors);
                 if state.visible {
                     state.resize_and_position();
                     state.render();
+                } else {
+                    state.sync_uia();
                 }
             }
             LRESULT(0)
@@ -1330,6 +1419,7 @@ unsafe extern "system" fn wnd_proc(
             } else if wparam.0 == TIMER_STATUS_CLEAR {
                 let _ = KillTimer(hwnd, TIMER_STATUS_CLEAR);
                 state.status_msg = None;
+                state.status_is_error = false;
                 if state.visible {
                     state.render();
                 }
@@ -1444,8 +1534,12 @@ unsafe extern "system" fn wnd_proc(
                     state.invoke_button(HoverTarget::SettingsButton, true);
                 }
                 0x25 | 0x27 if state.focused_btn.is_some() => {
-                    // Left/Right walk the footer like a toolbar
-                    let btns = state.footer_buttons();
+                    // Left/Right walk enabled footer buttons like a toolbar
+                    let btns: Vec<HoverTarget> = state
+                        .footer_buttons()
+                        .into_iter()
+                        .filter(|&b| state.button_enabled(b))
+                        .collect();
                     if let Some(p) = btns.iter().position(|b| Some(*b) == state.focused_btn) {
                         let n = btns.len();
                         let next = if wparam.0 == 0x27 { (p + 1) % n } else { (p + n - 1) % n };
@@ -1473,11 +1567,16 @@ unsafe extern "system" fn wnd_proc(
                     }
                 }
                 0x41 => state.trigger_ambient_measure(), // 'A'
-                0x4C => {
+                0x4C if state.monitors.len() > 1 => {
                     // 'L'
                     state.linked = !state.linked;
                     write_reg_bool(w!("Linked"), state.linked);
-                    state.render();
+                    let msg = if state.linked {
+                        "Displays linked (L)"
+                    } else {
+                        "Displays unlinked (L)"
+                    };
+                    state.set_status(msg, 1800);
                 }
                 0x52 => {
                     // 'R'
@@ -1510,7 +1609,14 @@ unsafe extern "system" fn wnd_proc(
             } else {
                 let total_h = compute_flyout_height_dip(state.monitors.len());
                 let show_auto = state.ambient_cap != AmbientCapability::None;
-                let new_hover = hit_test(x, y, state.monitors.len(), total_h, show_auto);
+                let mut new_hover = hit_test(x, y, state.monitors.len(), total_h, show_auto);
+                if matches!(
+                    new_hover,
+                    HoverTarget::AutoButton | HoverTarget::LinkButton | HoverTarget::RefreshButton | HoverTarget::SettingsButton
+                ) && !state.button_enabled(new_hover)
+                {
+                    new_hover = HoverTarget::None;
+                }
                 if new_hover != state.hover {
                     state.hover = new_hover;
                     state.render();
@@ -1644,7 +1750,69 @@ unsafe extern "system" fn wnd_proc(
             let _ = windows::Win32::Graphics::Gdi::EndPaint(hwnd, &ps);
             LRESULT(0)
         }
+        WM_GETOBJECT => {
+            if uia::is_uia_getobject(lparam) {
+                let root = state.uia.root_for_hwnd(hwnd);
+                return uia::return_raw_provider(hwnd, wparam, lparam, Some(&root));
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_UIA_ACTION => {
+            if let Some(action) = decode_action(wparam.0, lparam.0) {
+                match action {
+                    UiaAction::SetSliderValue { idx, pct_x100 } if !state.menu_open => {
+                        if idx < state.monitors.len() {
+                            state.set_monitor_brightness_f32(idx, pct_x100 as f32 / 100.0, false);
+                            update_tray_tooltip(hwnd, &state.monitors);
+                        }
+                    }
+                    UiaAction::FocusSlider(idx) if state.visible && !state.menu_open => {
+                        if idx < state.monitors.len() {
+                            if GetForegroundWindow() != hwnd {
+                                let _ = SetForegroundWindow(hwnd);
+                            }
+                            state.focused_btn = None;
+                            state.focused_idx = Some(idx);
+                            state.render();
+                        }
+                    }
+                    UiaAction::FocusButton(btn) if state.visible && !state.menu_open => {
+                        if state.footer_buttons().contains(&btn) && state.button_enabled(btn) {
+                            if GetForegroundWindow() != hwnd {
+                                let _ = SetForegroundWindow(hwnd);
+                            }
+                            state.focused_idx = None;
+                            state.focused_btn = Some(btn);
+                            state.render();
+                        }
+                    }
+                    UiaAction::InvokeButton(btn) if state.visible && !state.menu_open => {
+                        if state.footer_buttons().contains(&btn) && state.button_enabled(btn) {
+                            state.focused_idx = None;
+                            state.focused_btn = Some(btn);
+                            state.invoke_button(btn, true);
+                        }
+                    }
+                    UiaAction::ToggleLink if state.visible && !state.menu_open => {
+                        if state.monitors.len() > 1 {
+                            state.linked = !state.linked;
+                            write_reg_bool(w!("Linked"), state.linked);
+                            let msg = if state.linked {
+                                "Displays linked (L)"
+                            } else {
+                                "Displays unlinked (L)"
+                            };
+                            state.set_status(msg, 1800);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            LRESULT(0)
+        }
         WM_DESTROY => {
+            let _ = uia::return_raw_provider(hwnd, WPARAM(0), LPARAM(0), None);
+            uia::disconnect_all_providers();
             PostQuitMessage(0);
             LRESULT(0)
         }
