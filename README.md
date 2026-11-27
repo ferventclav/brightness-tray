@@ -18,10 +18,21 @@ The popup menu holds six items. **Match room light (Auto)** takes a one-shot amb
 
 ## Quick Start
 
-1. Download `brightness-tray.exe` from the [latest GitHub Release](https://github.com/ferventclav/brightness-tray/releases/latest) and save it in a folder such as `C:\Tools\brightness-tray.exe`.
-2. Double-click it. There is a sun icon in the system tray (or inside the `^` overflow menu until you pin it), and running the exe a second time opens the flyout instead of starting a second copy.
-3. Left-click the tray icon, or press `Win+B`, arrow to the icon and hit `Enter` to open the flyout right beside it. Drag any slider or scroll over a monitor card (`±5%` per notch, `Shift` for `±1%`); precision touchpad swipes move at the same notch rate. From the keyboard, `Tab` and `Up`/`Down` move across displays and enabled footer buttons, `Left`/`Right` (`Shift` for `±1%`), `PageUp`/`PageDown` (`±10%`), `Home`/`End` (`0%`/`100%`), `A` for Auto, `L` to Link, `R` to Refresh, `Enter`/`Space` on a footer button, the `Menu` key for Settings, and `Esc` to dismiss.
-4. To launch at logon, open the Settings menu and check **Run at Windows startup**. If you move the executable later, running it once from the new folder updates the startup path automatically, while turning it off in Task Manager's Startup tab shows it unchecked here.
+1. Download `brightness-tray.exe` from the [latest GitHub Release](https://github.com/ferventclav/brightness-tray/releases/latest) and save it in any folder, for example `C:\Tools\`.
+2. Double-click it. The brightness icon appears in the system tray, or in the `^` overflow menu until you drag it onto the taskbar. Running the exe again while it is open brings up the flyout instead of a second copy.
+3. Open the flyout:
+   - Left-click the tray icon.
+   - Or press `Win+B`, arrow to the icon and press `Enter`. Opened from the keyboard, the flyout appears beside the tray icon wherever the mouse is.
+4. Adjust brightness:
+   - Drag a slider, or scroll over a display card: `±5%` per notch, `±1%` with `Shift`. A touchpad swipe moves at the same rate as a mouse notch.
+   - `Up`/`Down` pick a display. `Left`/`Right` change it by 5% (`Shift` for 1%), `PageUp`/`PageDown` by 10%, and `Home`/`End` jump to 0% or 100%.
+   - `Tab` moves through the displays and then the toolbar buttons. `Enter` or `Space` presses a button, and `Esc` closes the flyout.
+   - Shortcuts: `A` for Auto, `L` for Link, `R` for Refresh, and the `Menu` key for Settings.
+5. Use the toolbar:
+   - **Auto** matches your room light. It shows only when your PC has a light sensor or a webcam, and says "Camera in use" if another app has the camera.
+   - **Link** moves all displays together. It is turned off when only one display is connected.
+   - **Refresh** re-scans displays after you plug in or wake a monitor.
+6. To start with Windows, open Settings (the gear, or right-click the tray icon) and check **Run at Windows startup**. If you move the exe later, run it once from its new folder and the startup entry follows it. Turning the app off in Task Manager's Startup tab shows here as unchecked.
 
 > **Note for external monitors:** Enable **DDC/CI** in your monitor's on-screen display (OSD) menu so Windows can control its hardware backlight.
 
