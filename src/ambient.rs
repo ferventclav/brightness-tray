@@ -15,6 +15,14 @@ pub enum AmbientCapability {
     None,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AmbientResult {
+    Brightness(u32),
+    CameraInUse,
+    CameraDenied,
+    Unavailable,
+}
+
 /// Detects the best available ambient-light source on the current hardware:
 /// 1. Dedicated hardware Ambient Light Sensor (ALS) via WinRT `LightSensor`
 /// 2. Video capture webcam via Media Foundation
@@ -29,12 +37,11 @@ pub fn detect_capability() -> AmbientCapability {
     AmbientCapability::None
 }
 
-/// Measures ambient room light and returns a perceptual target brightness (12..=100%).
-/// Prefers a dedicated hardware LightSensor when present; otherwise falls back to
-/// non-exclusive webcam room-light sampling.
-pub fn measure_ambient_brightness() -> Option<u32> {
+/// Measures ambient room light and returns a perceptual target brightness (12..=100%)
+/// or a specific reason if unavailable.
+pub fn measure_ambient_brightness() -> AmbientResult {
     if let Some(lux) = read_als_lux() {
-        return Some(lux_to_brightness(lux));
+        return AmbientResult::Brightness(lux_to_brightness(lux));
     }
     camera::measure_room_brightness()
 }
@@ -69,10 +76,14 @@ fn has_any_webcam() -> bool {
                     let mut devices_ptr = std::ptr::null_mut();
                     let mut count = 0u32;
                     if MFEnumDeviceSources(&attrs, &mut devices_ptr, &mut count).is_ok() {
-                        found = count > 0;
                         if !devices_ptr.is_null() {
                             let devices =
                                 std::slice::from_raw_parts_mut(devices_ptr, count as usize);
+                            found = devices.iter().any(|opt| {
+                                opt.as_ref()
+                                    .map(|act| !camera::is_virtual_camera_name(&camera::activate_friendly_name(act)))
+                                    .unwrap_or(false)
+                            });
                             for dev in devices.iter_mut() {
                                 *dev = None;
                             }

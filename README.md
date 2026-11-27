@@ -26,8 +26,9 @@ Open the Fluent 2 Acrylic menu by **right-clicking** the tray icon or clicking t
 1. **Download:** Grab `brightness-tray.exe` from the [latest GitHub Release](https://github.com/ferventclav/brightness-tray/releases/latest) and place it anywhere you like (e.g. `C:\Tools\brightness-tray.exe`).
 2. **Run:** Double-click `brightness-tray.exe`. Look for the brightness icon in your system tray (or inside the `^` overflow menu, then drag it onto the taskbar).
 3. **Adjust brightness:**
-   - **Left-click** the tray icon to open the flyout.
-   - **Drag** a slider or **scroll the mouse wheel** over any monitor card (`±5%`).
+   - **Left-click** the tray icon (or press `Win+B`, select it, and hit `Enter`) to open the flyout.
+   - **Drag** a slider or **scroll the mouse wheel** over any monitor card (`±5%`, or hold `Shift` while scrolling for `±1%`).
+   - **Keyboard:** Use `Up`/`Down` or `Tab` to select a display, `Left`/`Right` to adjust brightness (`Shift` for `±1%`), `A` for Auto, `L` to Link, `R` to Refresh, and `Esc` to close.
    - Click **Auto** *(shown when your PC has a light sensor or webcam)* to match your room lighting.
    - Click the **Link** icon to adjust all monitors together.
    - Click **Refresh** if you plug in or wake an external monitor.

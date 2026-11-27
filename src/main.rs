@@ -9,12 +9,15 @@ mod theme;
 mod ui;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{
+    ERROR_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, GetDC, ReleaseDC,
     SelectObject, SetBkColor, SetTextColor, TextOutW, ANTIALIASED_QUALITY, BITMAPINFO,
@@ -38,44 +41,55 @@ use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    GetKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE,
-    NIM_MODIFY, NIM_SETVERSION, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
+    NIM_MODIFY, NIM_SETVERSION, NIN_SELECT, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyIcon, DispatchMessageW,
-    GetCursorPos, GetMessageW, GetSystemMetrics, KillTimer, LoadCursorW, PostMessageW,
-    PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetCursor, SetForegroundWindow,
-    SetTimer, SetWindowPos, ShowWindow, TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
-    HICON, HWND_TOPMOST, ICONINFO, IDC_ARROW, IDC_HAND, MSG, SM_CXSMICON, SWP_NOACTIVATE,
-    SWP_SHOWWINDOW, SW_HIDE, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_COMMAND, WM_CREATE, WM_DESTROY,
-    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_PAINT, WM_POWERBROADCAST, WM_RBUTTONUP, WM_SETCURSOR, WM_SETTINGCHANGE,
-    WM_TIMER, DEVICE_NOTIFY_WINDOW_HANDLE, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND,
-    PBT_POWERSETTINGCHANGE, WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP,
+    GetCursorPos, GetForegroundWindow, GetMessageW, GetSystemMetrics, GetWindowRect, KillTimer,
+    LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetCursor,
+    SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, TranslateMessage, CREATESTRUCTW,
+    CS_HREDRAW, CS_VREDRAW, HICON, HWND_TOPMOST, ICONINFO, IDC_ARROW, IDC_HAND, MSG, SM_CXSMICON,
+    SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CAPTURECHANGED,
+    WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_KEYDOWN,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_POWERBROADCAST,
+    WM_RBUTTONUP, WM_SETCURSOR, WM_SETTINGCHANGE, WM_TIMER, DEVICE_NOTIFY_WINDOW_HANDLE,
+    PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_POWERSETTINGCHANGE, WNDCLASSW,
+    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
-use ambient::AmbientCapability;
-use monitors::MonitorManager;
+use ambient::{AmbientCapability, AmbientResult};
+use monitors::{BackendKind, MonitorManager};
 use theme::ThemeColors;
 use ui::{
     apply_win11_backdrop, card_index_at, compute_flyout_height_dip, compute_flyout_position,
-    hit_test, x_to_brightness_f32, HoverTarget, Renderer, UiMonitor, FLYOUT_WIDTH_DIP,
+    hit_test, monitor_work_area_and_dpi_at, x_to_brightness_f32, HoverTarget, RenderState,
+    Renderer, UiMonitor, FLYOUT_WIDTH_DIP,
 };
 
 const WM_TRAY_ICON: u32 = WM_APP + 1;
 const WM_MONITORS_UPDATED: u32 = WM_APP + 2;
 const WM_AUTO_BRIGHTNESS_RESULT: u32 = WM_APP + 3;
 const WM_MOUSELEAVE: u32 = 0x02A3;
+const WM_DWMCOLORIZATIONCOLORCHANGED: u32 = 0x0320;
+const NIN_KEYSELECT: u32 = NIN_SELECT + 1;
 const TRAY_ICON_ID: u32 = 1;
 const TIMER_REBUILD_TRAY: usize = 100;
 const TIMER_WAKE_AUTO: usize = 102;
 const TIMER_ANIM_SLIDER: usize = 103;
 const TIMER_AMBIENT_TIMEOUT: usize = 104;
 const TIMER_RETRY_TRAY: usize = 105;
+const TIMER_DISPLAY_CHANGE: usize = 106;
+const TIMER_DDC_RETRY: usize = 107;
+const TIMER_REFRESH_ANIM: usize = 108;
+const TIMER_STATUS_CLEAR: usize = 109;
+
+const AMBIENT_RES_CAMERA_IN_USE: usize = 101;
+const AMBIENT_RES_CAMERA_DENIED: usize = 102;
+const AMBIENT_RES_UNAVAILABLE: usize = 103;
 
 const CMD_TOGGLE_STARTUP: usize = 1001;
 const CMD_TOGGLE_LINK: usize = 1002;
@@ -85,9 +99,16 @@ const CMD_MEASURE_AMBIENT: usize = 1005;
 const CMD_TOGGLE_WAKE_AUTO: usize = 1006;
 
 enum WorkerCmd {
-    Refresh,
+    Refresh { gen: u64 },
     SetBrightness { id: String, brightness: u32, smooth: bool },
     Shutdown,
+}
+
+struct RefreshSnapshot {
+    monitors: Vec<UiMonitor>,
+    ambient_cap: AmbientCapability,
+    has_pending_ddc: bool,
+    gen: u64,
 }
 
 struct AppState {
@@ -97,14 +118,22 @@ struct AppState {
     theme: ThemeColors,
     renderer: Option<Renderer>,
     monitors: Vec<UiMonitor>,
-    shared_monitors: Arc<Mutex<Vec<UiMonitor>>>,
+    shared_snapshot: Arc<Mutex<RefreshSnapshot>>,
     latest_targets: Arc<Mutex<HashMap<String, u32>>>,
+    interaction_gen: Arc<AtomicU64>,
+    abort_ramp: Arc<AtomicBool>,
     worker_tx: Sender<WorkerCmd>,
     hover: HoverTarget,
     dragging_idx: Option<usize>,
+    drag_anchors: Option<Vec<(String, f32)>>,
+    focused_idx: Option<usize>,
     linked: bool,
     ambient_cap: AmbientCapability,
     measuring_ambient: bool,
+    refreshing: bool,
+    refresh_angle: f32,
+    ddc_retry_scheduled: bool,
+    status_msg: Option<String>,
     auto_on_wake: bool,
     visible: bool,
     menu_open: bool,
@@ -123,26 +152,85 @@ impl AppState {
         }
     }
 
-    fn size_px(&self) -> (u32, u32) {
-        let dpi = self.dpi() as f32;
-        let w = (FLYOUT_WIDTH_DIP * dpi / 96.0).round() as u32;
+    fn size_px_for_dpi(&self, dpi: u32) -> (u32, u32) {
+        let dpi_f = dpi as f32;
+        let w = (FLYOUT_WIDTH_DIP * dpi_f / 96.0).round() as u32;
         let h_dip = compute_flyout_height_dip(self.monitors.len());
-        let h = (h_dip * dpi / 96.0).round() as u32;
+        let h = (h_dip * dpi_f / 96.0).round() as u32;
         (w.max(100), h.max(100))
     }
 
-    fn render(&self) {
-        if let Some(r) = &self.renderer {
-            let _ = r.render(
-                &self.monitors,
-                &self.theme,
-                self.hover,
-                self.dragging_idx,
-                self.linked,
-                self.measuring_ambient,
-                self.ambient_cap != AmbientCapability::None,
-                self.dpi() as f32,
-            );
+    fn footer_hint(&self) -> Option<&str> {
+        if self.measuring_ambient {
+            Some("Sampling room light...")
+        } else if self.refreshing {
+            Some("Refreshing displays...")
+        } else if let Some(msg) = self.status_msg.as_deref() {
+            Some(msg)
+        } else {
+            match self.hover {
+                HoverTarget::AutoButton => Some("Match room light"),
+                HoverTarget::LinkButton => Some(if self.linked {
+                    "Linked (adjusts all)"
+                } else {
+                    "Link sliders"
+                }),
+                HoverTarget::RefreshButton => Some("Refresh displays"),
+                HoverTarget::SettingsButton => Some("Settings"),
+                _ => None,
+            }
+        }
+    }
+
+    fn set_status(&mut self, msg: &str, duration_ms: u32) {
+        self.status_msg = Some(msg.to_string());
+        unsafe {
+            let _ = SetTimer(self.hwnd, TIMER_STATUS_CLEAR, duration_ms, None);
+        }
+        if self.visible {
+            self.render();
+        }
+    }
+
+    fn render(&mut self) {
+        let dpi = self.dpi() as f32;
+        let hint = self.footer_hint().map(str::to_owned);
+        let rs = RenderState {
+            monitors: &self.monitors,
+            theme: &self.theme,
+            hover: self.hover,
+            dragging_idx: self.dragging_idx,
+            focused_idx: self.focused_idx,
+            linked: self.linked,
+            measuring_ambient: self.measuring_ambient,
+            refreshing: self.refreshing,
+            refresh_angle: self.refresh_angle,
+            show_auto: self.ambient_cap != AmbientCapability::None,
+            footer_hint: hint.as_deref(),
+            dpi,
+        };
+        let needs_recreate = match &self.renderer {
+            Some(r) => r.render(&rs).is_err(),
+            None => true,
+        };
+        if needs_recreate {
+            let (w, h) = self.size_px_for_dpi(self.dpi());
+            self.renderer = Renderer::new(self.hwnd, w, h, dpi).ok();
+            if let Some(r) = &self.renderer {
+                let _ = r.render(&rs);
+            }
+        }
+    }
+
+    fn request_refresh(&mut self, animate_icon: bool) {
+        let gen = self.interaction_gen.load(Ordering::Acquire);
+        let _ = self.worker_tx.send(WorkerCmd::Refresh { gen });
+        if animate_icon && self.visible {
+            self.refreshing = true;
+            unsafe {
+                let _ = SetTimer(self.hwnd, TIMER_REFRESH_ANIM, 16, None);
+            }
+            self.render();
         }
     }
 
@@ -152,17 +240,23 @@ impl AppState {
         }
         if !self.measuring_ambient {
             self.measuring_ambient = true;
+            self.status_msg = None;
             let hwnd_raw = self.hwnd.0 as isize;
             unsafe {
                 let _ = SetTimer(self.hwnd, TIMER_AMBIENT_TIMEOUT, 3500, None);
             }
             std::thread::spawn(move || {
-                let measured = ambient::measure_ambient_brightness().unwrap_or(u32::MAX);
+                let code = match ambient::measure_ambient_brightness() {
+                    AmbientResult::Brightness(b) => b.min(100) as usize,
+                    AmbientResult::CameraInUse => AMBIENT_RES_CAMERA_IN_USE,
+                    AmbientResult::CameraDenied => AMBIENT_RES_CAMERA_DENIED,
+                    AmbientResult::Unavailable => AMBIENT_RES_UNAVAILABLE,
+                };
                 unsafe {
                     let _ = PostMessageW(
                         HWND(hwnd_raw as *mut core::ffi::c_void),
                         WM_AUTO_BRIGHTNESS_RESULT,
-                        WPARAM(measured as usize),
+                        WPARAM(code),
                         LPARAM(0),
                     );
                 }
@@ -175,13 +269,24 @@ impl AppState {
 
     fn resize_and_position(&mut self) {
         let dpi = self.dpi();
-        let (w, h) = self.size_px();
-        let (_, y) = compute_flyout_position(w as i32, h as i32, dpi);
+        let (w, h) = self.size_px_for_dpi(dpi);
+        let center_pt = POINT {
+            x: self.anchor_x + (w as i32) / 2,
+            y: 0,
+        };
+        let (work_area, _) = monitor_work_area_and_dpi_at(center_pt);
+        let margin = ((12.0 * dpi as f32) / 96.0).round() as i32;
+        let x = self
+            .anchor_x
+            .max(work_area.left + margin)
+            .min(work_area.right - (w as i32) - margin);
+        self.anchor_x = x;
+        let y = (work_area.bottom - (h as i32) - margin).max(work_area.top + margin);
         unsafe {
             let _ = SetWindowPos(
                 self.hwnd,
                 HWND_TOPMOST,
-                self.anchor_x,
+                x,
                 y,
                 w as i32,
                 h as i32,
@@ -196,16 +301,21 @@ impl AppState {
     fn show_flyout(&mut self) {
         self.theme = ThemeColors::load();
         apply_win11_backdrop(self.hwnd, self.theme.is_dark);
-        let _ = self.worker_tx.send(WorkerCmd::Refresh);
+        self.focused_idx = None;
+        self.status_msg = None;
+        self.request_refresh(false);
 
-        let dpi = self.dpi();
-        let (w, h) = self.size_px();
-        let (x, y) = compute_flyout_position(w as i32, h as i32, dpi);
+        let mut cursor = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut cursor);
+        }
+        let (_, target_dpi) = monitor_work_area_and_dpi_at(cursor);
+        let (w, h) = self.size_px_for_dpi(target_dpi);
+        let (x, y) = compute_flyout_position(w as i32, h as i32, target_dpi);
         self.anchor_x = x;
         if let Some(r) = &mut self.renderer {
-            let _ = r.resize(w, h, dpi as f32);
+            let _ = r.resize(w, h, target_dpi as f32);
         }
-        self.render();
         unsafe {
             let _ = SetWindowPos(
                 self.hwnd,
@@ -218,6 +328,15 @@ impl AppState {
             );
             let _ = SetForegroundWindow(self.hwnd);
         }
+        // Re-render after SetWindowPos so DPI matches the destination monitor
+        let actual_dpi = self.dpi();
+        if actual_dpi != target_dpi {
+            let (aw, ah) = self.size_px_for_dpi(actual_dpi);
+            if let Some(r) = &mut self.renderer {
+                let _ = r.resize(aw, ah, actual_dpi as f32);
+            }
+        }
+        self.render();
         self.visible = true;
         self.last_show_time = Instant::now();
     }
@@ -226,9 +345,16 @@ impl AppState {
         if self.visible {
             self.visible = false;
             self.dragging_idx = None;
+            self.drag_anchors = None;
+            self.focused_idx = None;
             self.hover = HoverTarget::None;
+            self.refreshing = false;
+            self.refresh_angle = 0.0;
+            self.status_msg = None;
             self.last_hide_time = Instant::now();
             unsafe {
+                let _ = KillTimer(self.hwnd, TIMER_REFRESH_ANIM);
+                let _ = KillTimer(self.hwnd, TIMER_STATUS_CLEAR);
                 let _ = ReleaseCapture();
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
             }
@@ -250,12 +376,35 @@ impl AppState {
             return;
         };
         let old_val = self.monitors[idx].brightness;
-        let delta_f32 = new_val_f32 - old_val_f32;
+
+        self.interaction_gen.fetch_add(1, Ordering::Release);
+        if !smooth {
+            self.abort_ramp.store(true, Ordering::Release);
+            self.anim_start = None;
+        }
 
         if self.linked {
+            let (use_anchors, delta_f32) = if let Some(ref anchors) = self.drag_anchors {
+                let anchor_idx = self
+                    .monitors
+                    .get(idx)
+                    .and_then(|m| anchors.iter().find(|(id, _)| id == &m.id).map(|(_, v)| *v))
+                    .unwrap_or(old_val_f32);
+                (true, new_val_f32 - anchor_idx)
+            } else {
+                (false, new_val_f32 - old_val_f32)
+            };
+
             for (i, mon) in self.monitors.iter_mut().enumerate() {
                 let target_f32 = if i == idx {
                     new_val_f32
+                } else if use_anchors {
+                    let anchor_i = self
+                        .drag_anchors
+                        .as_ref()
+                        .and_then(|a| a.iter().find(|(id, _)| id == &mon.id).map(|(_, v)| *v))
+                        .unwrap_or(mon.visual_brightness);
+                    (anchor_i + delta_f32).clamp(0.0, 100.0)
                 } else {
                     (mon.visual_brightness + delta_f32).clamp(0.0, 100.0)
                 };
@@ -337,7 +486,7 @@ impl AppState {
             checked: None,
         });
 
-        let mut pt = windows::Win32::Foundation::POINT::default();
+        let mut pt = POINT::default();
         unsafe {
             let _ = GetCursorPos(&mut pt);
         }
@@ -348,7 +497,30 @@ impl AppState {
         if let Some(cmd_id) = selected {
             unsafe {
                 let _ = PostMessageW(self.hwnd, WM_COMMAND, WPARAM(cmd_id), LPARAM(0));
+                if self.visible && cmd_id != CMD_EXIT {
+                    let _ = SetForegroundWindow(self.hwnd);
+                }
             }
+        } else if self.visible {
+            unsafe {
+                let mut cur_pt = POINT::default();
+                let mut win_rect = RECT::default();
+                let _ = GetCursorPos(&mut cur_pt);
+                let _ = GetWindowRect(self.hwnd, &mut win_rect);
+                let inside_flyout = cur_pt.x >= win_rect.left
+                    && cur_pt.x <= win_rect.right
+                    && cur_pt.y >= win_rect.top
+                    && cur_pt.y <= win_rect.bottom;
+                if !inside_flyout && GetForegroundWindow() != self.hwnd {
+                    self.hide_flyout();
+                } else {
+                    let _ = SetForegroundWindow(self.hwnd);
+                }
+            }
+        }
+        if self.visible {
+            self.hover = HoverTarget::None;
+            self.render();
         }
     }
 }
@@ -386,8 +558,15 @@ fn main() {
         };
         RegisterClassW(&wc);
 
-        let shared_monitors: Arc<Mutex<Vec<UiMonitor>>> = Arc::new(Mutex::new(Vec::new()));
+        let shared_snapshot: Arc<Mutex<RefreshSnapshot>> = Arc::new(Mutex::new(RefreshSnapshot {
+            monitors: Vec::new(),
+            ambient_cap: AmbientCapability::None,
+            has_pending_ddc: false,
+            gen: 0,
+        }));
         let latest_targets: Arc<Mutex<HashMap<String, u32>>> = Arc::new(Mutex::new(HashMap::new()));
+        let interaction_gen = Arc::new(AtomicU64::new(0));
+        let abort_ramp = Arc::new(AtomicBool::new(false));
         let (worker_tx, worker_rx) = mpsc::channel::<WorkerCmd>();
 
         let theme = ThemeColors::load();
@@ -401,14 +580,22 @@ fn main() {
             theme,
             renderer: None,
             monitors: Vec::new(),
-            shared_monitors: shared_monitors.clone(),
+            shared_snapshot: shared_snapshot.clone(),
             latest_targets: latest_targets.clone(),
+            interaction_gen: interaction_gen.clone(),
+            abort_ramp: abort_ramp.clone(),
             worker_tx: worker_tx.clone(),
             hover: HoverTarget::None,
             dragging_idx: None,
+            drag_anchors: None,
+            focused_idx: None,
             linked: read_reg_bool(w!("Linked"), false),
-            ambient_cap: ambient::detect_capability(),
+            ambient_cap: AmbientCapability::None,
             measuring_ambient: false,
+            refreshing: false,
+            refresh_angle: 0.0,
+            ddc_retry_scheduled: false,
+            status_msg: None,
             auto_on_wake: read_reg_bool(w!("AutoOnWake"), false),
             visible: false,
             menu_open: false,
@@ -439,7 +626,7 @@ fn main() {
 
         state.hwnd = hwnd;
         apply_win11_backdrop(hwnd, state.theme.is_dark);
-        let (w, h) = state.size_px();
+        let (w, h) = state.size_px_for_dpi(state.dpi());
         state.renderer = Renderer::new(hwnd, w, h, state.dpi() as f32).ok();
 
         if !add_tray_icon(hwnd, state.tray_icon) {
@@ -453,20 +640,22 @@ fn main() {
 
         // Spawn dedicated background brightness worker thread (COM + WMI + DDC/CI)
         let hwnd_raw = hwnd.0 as isize;
-        let shared_for_worker = shared_monitors.clone();
+        let shared_for_worker = shared_snapshot.clone();
         let targets_for_worker = latest_targets.clone();
+        let abort_for_worker = abort_ramp.clone();
         std::thread::spawn(move || {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             let mut mgr = MonitorManager::new();
-            publish_monitors(&mgr, &shared_for_worker, hwnd_raw);
+            let cap = ambient::detect_capability();
+            publish_snapshot(&mgr, cap, 0, &shared_for_worker, hwnd_raw);
 
             while let Ok(first_cmd) = worker_rx.recv() {
-                let mut do_refresh = false;
+                let mut refresh_gen: Option<u64> = None;
                 let mut pending_sets: HashMap<String, (u32, bool)> = HashMap::new();
                 let mut should_exit = false;
 
                 let mut process_cmd = |cmd: WorkerCmd| match cmd {
-                    WorkerCmd::Refresh => do_refresh = true,
+                    WorkerCmd::Refresh { gen } => refresh_gen = Some(gen),
                     WorkerCmd::SetBrightness { id, brightness, smooth } => {
                         pending_sets.insert(id, (brightness, smooth));
                     }
@@ -481,55 +670,65 @@ fn main() {
                 if should_exit {
                     break;
                 }
-                if do_refresh {
+                if let Some(gen) = refresh_gen {
                     mgr.refresh();
-                    publish_monitors(&mgr, &shared_for_worker, hwnd_raw);
+                    let cap = ambient::detect_capability();
+                    publish_snapshot(&mgr, cap, gen, &shared_for_worker, hwnd_raw);
                 }
 
-                let mut smooth_jobs: Vec<(String, u32, u32)> = Vec::new();
+                let mut smooth_jobs: Vec<(String, u32, u32, bool)> = Vec::new();
                 for (id, (initial_target, smooth)) in pending_sets {
                     let target = targets_for_worker
                         .lock()
                         .ok()
                         .and_then(|m| m.get(&id).copied())
                         .unwrap_or(initial_target);
-                    let current = mgr
-                        .monitors
-                        .iter()
-                        .find(|m| m.id == id)
-                        .map(|m| m.brightness)
-                        .unwrap_or(target);
+                    let mon_meta = mgr.monitors.iter().find(|m| m.id == id);
+                    let current = mon_meta.map(|m| m.brightness).unwrap_or(target);
+                    let is_internal = mon_meta
+                        .map(|m| matches!(m.backend, BackendKind::InternalWmi))
+                        .unwrap_or(false);
 
                     if smooth && current.abs_diff(target) > 3 {
-                        smooth_jobs.push((id, current, target));
+                        smooth_jobs.push((id, current, target, is_internal));
                     } else {
                         mgr.set_brightness(&id, target);
                     }
                 }
 
-                // Interleave smooth transitions across ALL monitors simultaneously
+                // Interleave smooth transitions across ALL monitors (internal WMI first each step)
                 if !smooth_jobs.is_empty() {
+                    smooth_jobs.sort_by_key(|(_, _, _, is_int)| !*is_int);
+                    abort_for_worker.store(false, Ordering::Release);
+
                     let max_diff = smooth_jobs
                         .iter()
-                        .map(|(_, c, t)| c.abs_diff(*t))
+                        .map(|(_, c, t, _)| c.abs_diff(*t))
                         .max()
                         .unwrap_or(0);
                     let steps = max_diff.min(24);
                     let delay_ms = 26u64;
+                    let mut last_sent: Vec<Option<u32>> = vec![None; smooth_jobs.len()];
+                    let mut alive: Vec<bool> = vec![true; smooth_jobs.len()];
 
                     'ramp: for s in 1..=steps {
+                        if abort_for_worker.load(Ordering::Acquire) {
+                            break 'ramp;
+                        }
                         let t = s as f32 / steps as f32;
                         let eased = ease_in_out_cubic(t);
 
-                        for (id, current, target) in &smooth_jobs {
+                        for (j, (id, current, target, _)) in smooth_jobs.iter().enumerate() {
+                            if abort_for_worker.load(Ordering::Acquire) {
+                                break 'ramp;
+                            }
                             let latest = targets_for_worker
                                 .lock()
                                 .ok()
                                 .and_then(|m| m.get(id).copied())
                                 .unwrap_or(*target);
                             if latest != *target {
-                                // User grabbed a slider mid-ramp: apply latest immediately and abort ramp
-                                for (rem_id, _, rem_tgt) in &smooth_jobs {
+                                for (rem_id, _, rem_tgt, _) in &smooth_jobs {
                                     let l = targets_for_worker
                                         .lock()
                                         .ok()
@@ -539,10 +738,19 @@ fn main() {
                                 }
                                 break 'ramp;
                             }
+                            if !alive[j] {
+                                continue;
+                            }
                             let val = (*current as f32 + (*target as f32 - *current as f32) * eased)
                                 .round()
                                 .clamp(0.0, 100.0) as u32;
-                            mgr.set_brightness(id, val);
+                            if last_sent[j] != Some(val) {
+                                if mgr.set_brightness(id, val) {
+                                    last_sent[j] = Some(val);
+                                } else {
+                                    alive[j] = false;
+                                }
+                            }
                         }
                         if s < steps {
                             std::thread::sleep(Duration::from_millis(delay_ms));
@@ -561,6 +769,7 @@ fn main() {
             DispatchMessageW(&msg);
         }
 
+        state.abort_ramp.store(true, Ordering::Release);
         let _ = worker_tx.send(WorkerCmd::Shutdown);
         remove_tray_icon(hwnd);
         if !state.tray_icon.is_invalid() {
@@ -570,7 +779,13 @@ fn main() {
     }
 }
 
-fn publish_monitors(mgr: &MonitorManager, shared: &Arc<Mutex<Vec<UiMonitor>>>, hwnd_raw: isize) {
+fn publish_snapshot(
+    mgr: &MonitorManager,
+    ambient_cap: AmbientCapability,
+    gen: u64,
+    shared: &Arc<Mutex<RefreshSnapshot>>,
+    hwnd_raw: isize,
+) {
     let list: Vec<UiMonitor> = mgr
         .monitors
         .iter()
@@ -584,7 +799,12 @@ fn publish_monitors(mgr: &MonitorManager, shared: &Arc<Mutex<Vec<UiMonitor>>>, h
         })
         .collect();
     if let Ok(mut guard) = shared.lock() {
-        *guard = list;
+        *guard = RefreshSnapshot {
+            monitors: list,
+            ambient_cap,
+            has_pending_ddc: mgr.has_pending_ddc,
+            gen,
+        };
     }
     unsafe {
         let _ = PostMessageW(
@@ -633,7 +853,7 @@ unsafe extern "system" fn wnd_proc(
         WM_TRAY_ICON => {
             let notif = (lparam.0 & 0xFFFF) as u32;
             match notif {
-                WM_LBUTTONUP => {
+                WM_LBUTTONUP | NIN_KEYSELECT => {
                     state.toggle_flyout();
                 }
                 WM_RBUTTONUP => {
@@ -644,10 +864,55 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_MONITORS_UPDATED => {
-            if state.dragging_idx.is_none() {
-                if let Ok(guard) = state.shared_monitors.lock() {
-                    state.monitors = guard.clone();
+            let snapshot = state.shared_snapshot.lock().ok().map(|g| RefreshSnapshot {
+                monitors: g.monitors.clone(),
+                ambient_cap: g.ambient_cap,
+                has_pending_ddc: g.has_pending_ddc,
+                gen: g.gen,
+            });
+            if let Some(snap) = snapshot {
+                state.ambient_cap = snap.ambient_cap;
+                if state.refreshing {
+                    state.refreshing = false;
+                    state.refresh_angle = 0.0;
+                    let _ = KillTimer(hwnd, TIMER_REFRESH_ANIM);
                 }
+                if snap.has_pending_ddc && !state.ddc_retry_scheduled {
+                    state.ddc_retry_scheduled = true;
+                    let _ = SetTimer(hwnd, TIMER_DDC_RETRY, 2000, None);
+                }
+
+                let cur_gen = state.interaction_gen.load(Ordering::Acquire);
+                let preserve_active =
+                    snap.gen < cur_gen || state.dragging_idx.is_some() || state.anim_start.is_some();
+
+                if preserve_active {
+                    let prev_map: HashMap<String, UiMonitor> = state
+                        .monitors
+                        .iter()
+                        .map(|m| (m.id.clone(), m.clone()))
+                        .collect();
+                    let mut merged = snap.monitors;
+                    for m in &mut merged {
+                        if let Some(prev) = prev_map.get(&m.id) {
+                            m.brightness = prev.brightness;
+                            m.visual_brightness = prev.visual_brightness;
+                            m.anim_from = prev.anim_from;
+                        }
+                    }
+                    state.monitors = merged;
+                } else {
+                    state.monitors = snap.monitors;
+                }
+
+                if let Some(f) = state.focused_idx {
+                    if state.monitors.is_empty() {
+                        state.focused_idx = None;
+                    } else if f >= state.monitors.len() {
+                        state.focused_idx = Some(state.monitors.len() - 1);
+                    }
+                }
+
                 update_tray_tooltip(hwnd, &state.monitors);
                 if state.visible {
                     state.resize_and_position();
@@ -659,8 +924,11 @@ unsafe extern "system" fn wnd_proc(
         WM_AUTO_BRIGHTNESS_RESULT => {
             let _ = KillTimer(hwnd, TIMER_AMBIENT_TIMEOUT);
             state.measuring_ambient = false;
-            let pct = wparam.0 as u32;
-            if pct <= 100 {
+            let code = wparam.0;
+            if code <= 100 {
+                let pct = code as u32;
+                state.interaction_gen.fetch_add(1, Ordering::Release);
+                state.abort_ramp.store(false, Ordering::Release);
                 for mon in &mut state.monitors {
                     mon.anim_from = mon.visual_brightness;
                     if mon.brightness != pct {
@@ -684,6 +952,13 @@ unsafe extern "system" fn wnd_proc(
                         mon.visual_brightness = pct as f32;
                     }
                 }
+            } else {
+                let reason = match code {
+                    AMBIENT_RES_CAMERA_IN_USE => "Camera in use",
+                    AMBIENT_RES_CAMERA_DENIED => "Camera access off",
+                    _ => "Sensor unavailable",
+                };
+                state.set_status(reason, 2400);
             }
             if state.visible {
                 state.render();
@@ -691,10 +966,11 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_DISPLAYCHANGE => {
-            let _ = state.worker_tx.send(WorkerCmd::Refresh);
+            state.ddc_retry_scheduled = false;
+            let _ = SetTimer(hwnd, TIMER_DISPLAY_CHANGE, 600, None);
             LRESULT(0)
         }
-        WM_SETTINGCHANGE => {
+        WM_SETTINGCHANGE | WM_DWMCOLORIZATIONCOLORCHANGED => {
             let old_dark = state.theme.is_dark;
             state.theme = ThemeColors::load();
             if old_dark != state.theme.is_dark {
@@ -715,11 +991,33 @@ unsafe extern "system" fn wnd_proc(
                 }
                 state.tray_icon = create_monitor_tray_icon(state.theme.is_dark);
                 if !add_tray_icon(hwnd, state.tray_icon) {
-            let _ = SetTimer(hwnd, TIMER_RETRY_TRAY, 1000, None);
-        }
+                    let _ = SetTimer(hwnd, TIMER_RETRY_TRAY, 1000, None);
+                }
+            } else if wparam.0 == TIMER_DISPLAY_CHANGE {
+                let _ = KillTimer(hwnd, TIMER_DISPLAY_CHANGE);
+                state.request_refresh(state.visible);
+            } else if wparam.0 == TIMER_DDC_RETRY {
+                let _ = KillTimer(hwnd, TIMER_DDC_RETRY);
+                state.request_refresh(state.visible);
+            } else if wparam.0 == TIMER_REFRESH_ANIM {
+                if !state.refreshing || !state.visible {
+                    let _ = KillTimer(hwnd, TIMER_REFRESH_ANIM);
+                    state.refresh_angle = 0.0;
+                } else {
+                    state.refresh_angle =
+                        (state.refresh_angle + 0.24) % (2.0 * std::f32::consts::PI);
+                    state.render();
+                }
+            } else if wparam.0 == TIMER_STATUS_CLEAR {
+                let _ = KillTimer(hwnd, TIMER_STATUS_CLEAR);
+                state.status_msg = None;
+                if state.visible {
+                    state.render();
+                }
             } else if wparam.0 == TIMER_WAKE_AUTO {
                 let _ = KillTimer(hwnd, TIMER_WAKE_AUTO);
-                let _ = state.worker_tx.send(WorkerCmd::Refresh);
+                state.ddc_retry_scheduled = false;
+                state.request_refresh(state.visible);
                 if state.auto_on_wake {
                     state.trigger_ambient_measure();
                 }
@@ -753,9 +1051,7 @@ unsafe extern "system" fn wnd_proc(
                 let _ = KillTimer(hwnd, TIMER_AMBIENT_TIMEOUT);
                 if state.measuring_ambient {
                     state.measuring_ambient = false;
-                    if state.visible {
-                        state.render();
-                    }
+                    state.set_status("Sensor timed out", 2400);
                 }
             }
             LRESULT(0)
@@ -806,8 +1102,70 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_KEYDOWN => {
-            if wparam.0 == 0x1B {
-                state.hide_flyout();
+            let shift_down = (GetKeyState(0x10) as u16 & 0x8000) != 0;
+            match wparam.0 {
+                0x1B => state.hide_flyout(),
+                0x26 => {
+                    // VK_UP
+                    let count = state.monitors.len();
+                    if count > 0 {
+                        state.focused_idx = Some(match state.focused_idx {
+                            Some(i) => (i + count - 1) % count,
+                            None => count - 1,
+                        });
+                        state.render();
+                    }
+                }
+                0x28 => {
+                    // VK_DOWN
+                    let count = state.monitors.len();
+                    if count > 0 {
+                        state.focused_idx = Some(match state.focused_idx {
+                            Some(i) => (i + 1) % count,
+                            None => 0,
+                        });
+                        state.render();
+                    }
+                }
+                0x09 => {
+                    // VK_TAB (or Shift+Tab)
+                    let count = state.monitors.len();
+                    if count > 0 {
+                        state.focused_idx = Some(match state.focused_idx {
+                            Some(i) if shift_down => (i + count - 1) % count,
+                            Some(i) => (i + 1) % count,
+                            None if shift_down => count - 1,
+                            None => 0,
+                        });
+                        state.render();
+                    }
+                }
+                0x25 | 0x27 => {
+                    // VK_LEFT / VK_RIGHT
+                    if !state.monitors.is_empty() {
+                        let idx = state.focused_idx.unwrap_or(0);
+                        state.focused_idx = Some(idx);
+                        let step = if shift_down { 1 } else { 5 };
+                        let dir = if wparam.0 == 0x27 { step } else { -step };
+                        let cur = state.monitors[idx].brightness as i32;
+                        let next = (cur + dir).clamp(0, 100) as f32;
+                        state.set_monitor_brightness_f32(idx, next, false);
+                        update_tray_tooltip(hwnd, &state.monitors);
+                    }
+                }
+                0x41 => state.trigger_ambient_measure(), // 'A'
+                0x4C => {
+                    // 'L'
+                    state.linked = !state.linked;
+                    write_reg_bool(w!("Linked"), state.linked);
+                    state.render();
+                }
+                0x52 => {
+                    // 'R'
+                    state.ddc_retry_scheduled = false;
+                    state.request_refresh(true);
+                }
+                _ => {}
             }
             LRESULT(0)
         }
@@ -856,10 +1214,18 @@ unsafe extern "system" fn wnd_proc(
             let total_h = compute_flyout_height_dip(state.monitors.len());
             let show_auto = state.ambient_cap != AmbientCapability::None;
             let target = hit_test(x, y, state.monitors.len(), total_h, show_auto);
+            state.focused_idx = None;
 
             match target {
                 HoverTarget::Slider(idx) => {
                     state.dragging_idx = Some(idx);
+                    state.drag_anchors = Some(
+                        state
+                            .monitors
+                            .iter()
+                            .map(|m| (m.id.clone(), m.visual_brightness))
+                            .collect(),
+                    );
                     SetCapture(hwnd);
                     let b = x_to_brightness_f32(x);
                     state.set_monitor_brightness_f32(idx, b, false);
@@ -873,7 +1239,8 @@ unsafe extern "system" fn wnd_proc(
                     state.render();
                 }
                 HoverTarget::RefreshButton => {
-                    let _ = state.worker_tx.send(WorkerCmd::Refresh);
+                    state.ddc_retry_scheduled = false;
+                    state.request_refresh(true);
                 }
                 HoverTarget::SettingsButton => {
                     state.show_context_menu();
@@ -885,17 +1252,31 @@ unsafe extern "system" fn wnd_proc(
         WM_LBUTTONUP => {
             if state.dragging_idx.is_some() {
                 state.dragging_idx = None;
+                state.drag_anchors = None;
                 let _ = ReleaseCapture();
                 update_tray_tooltip(hwnd, &state.monitors);
                 state.render();
             }
             LRESULT(0)
         }
+        WM_CAPTURECHANGED => {
+            if state.dragging_idx.is_some() && lparam.0 != hwnd.0 as isize {
+                state.dragging_idx = None;
+                state.drag_anchors = None;
+                update_tray_tooltip(hwnd, &state.monitors);
+                if state.visible {
+                    state.render();
+                }
+            }
+            LRESULT(0)
+        }
         WM_MOUSEWHEEL => {
             let delta = ((wparam.0 >> 16) as i16) as i32;
-            let step = if delta > 0 { 5 } else { -5 };
+            let shift_down = (GetKeyState(0x10) as u16 & 0x8000) != 0;
+            let mag = if shift_down { 1 } else { 5 };
+            let step = if delta > 0 { mag } else { -mag };
 
-            let mut pt = windows::Win32::Foundation::POINT {
+            let mut pt = POINT {
                 x: ((lparam.0 & 0xFFFF) as i16) as i32,
                 y: (((lparam.0 >> 16) & 0xFFFF) as i16) as i32,
             };
@@ -905,6 +1286,7 @@ unsafe extern "system" fn wnd_proc(
             let y = pt.y as f32 / scale;
 
             if let Some(idx) = card_index_at(x, y, state.monitors.len()) {
+                state.focused_idx = None;
                 let cur = state.monitors[idx].brightness as i32;
                 let next = (cur + step).clamp(0, 100) as f32;
                 state.set_monitor_brightness_f32(idx, next, false);
@@ -934,7 +1316,8 @@ unsafe extern "system" fn wnd_proc(
                     }
                 }
                 CMD_REFRESH => {
-                    let _ = state.worker_tx.send(WorkerCmd::Refresh);
+                    state.ddc_retry_scheduled = false;
+                    state.request_refresh(state.visible);
                 }
                 CMD_EXIT => {
                     PostQuitMessage(0);
@@ -1126,16 +1509,48 @@ fn ease_in_out_cubic(t: f32) -> f32 {
     }
 }
 
+fn format_tray_tooltip(monitors: &[UiMonitor]) -> String {
+    const HEADER: &str = "Display Brightness";
+    const MAX_CHARS: usize = 127;
+    if monitors.is_empty() {
+        return HEADER.to_string();
+    }
+
+    let full_parts: Vec<String> = monitors
+        .iter()
+        .map(|m| format!("{}: {}%", m.name, m.brightness))
+        .collect();
+    let full = format!("{}\n{}", HEADER, full_parts.join(" · "));
+    if full.encode_utf16().count() <= MAX_CHARS {
+        return full;
+    }
+
+    // Budget per monitor so percentages never get clipped by szTip[128]
+    let mut out = String::from(HEADER);
+    let max_items = monitors.len().min(4);
+    let per_item_budget = ((MAX_CHARS - HEADER.len() - 1) / max_items).saturating_sub(3);
+    for (i, m) in monitors.iter().take(max_items).enumerate() {
+        let suffix = format!(": {}%", m.brightness);
+        let name_budget = per_item_budget.saturating_sub(suffix.len());
+        let short_name: String = if m.name.chars().count() > name_budget && name_budget >= 4 {
+            let truncated: String = m.name.chars().take(name_budget - 1).collect();
+            format!("{}…", truncated.trim_end())
+        } else {
+            m.name.chars().take(name_budget).collect()
+        };
+        let sep = if i == 0 { "\n" } else { " · " };
+        let candidate = format!("{}{}{}{}", out, sep, short_name, suffix);
+        if candidate.encode_utf16().count() <= MAX_CHARS {
+            out = candidate;
+        } else {
+            break;
+        }
+    }
+    out
+}
+
 fn update_tray_tooltip(hwnd: HWND, monitors: &[UiMonitor]) {
-    let tip_text = if monitors.is_empty() {
-        "Display Brightness".to_string()
-    } else {
-        let parts: Vec<String> = monitors
-            .iter()
-            .map(|m| format!("{}: {}%", m.name, m.brightness))
-            .collect();
-        format!("Display Brightness\n{}", parts.join(" · "))
-    };
+    let tip_text = format_tray_tooltip(monitors);
     unsafe {
         let mut nid = NOTIFYICONDATAW {
             cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
@@ -1149,6 +1564,29 @@ fn update_tray_tooltip(hwnd: HWND, monitors: &[UiMonitor]) {
         nid.szTip[..len].copy_from_slice(&tip[..len]);
         nid.szTip[nid.szTip.len() - 1] = 0;
         let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tooltip_respects_127_utf16_limit() {
+        let mons = (1..=4)
+            .map(|n| UiMonitor {
+                id: format!("id{n}"),
+                display_number: n,
+                name: format!("Very Long External Monitor Name Model ABCDEFG {n}"),
+                brightness: 50 + n * 10,
+                visual_brightness: 50.0,
+                anim_from: 50.0,
+            })
+            .collect::<Vec<_>>();
+        let tip = format_tray_tooltip(&mons);
+        assert!(tip.encode_utf16().count() <= 127);
+        assert!(tip.contains("60%"));
+        assert!(tip.contains("70%"));
     }
 }
 

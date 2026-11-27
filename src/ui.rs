@@ -6,12 +6,14 @@ use windows::Win32::Graphics::Direct2D::Common::{
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1Bitmap1, ID2D1Device, ID2D1DeviceContext, ID2D1Factory,
-    ID2D1Factory1, ID2D1RenderTarget, ID2D1SolidColorBrush, D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-    D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1, D2D1_CAP_STYLE_ROUND,
-    D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_ROUNDED_RECT,
-    D2D1_STROKE_STYLE_PROPERTIES,
+    ID2D1Factory1, ID2D1RenderTarget, ID2D1SolidColorBrush, ID2D1StrokeStyle,
+    D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1,
+    D2D1_CAP_STYLE_ROUND, D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED,
+    D2D1_ROUNDED_RECT, D2D1_STROKE_STYLE_PROPERTIES,
 };
-use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
+use windows::Win32::Graphics::Direct3D::{
+    D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL_11_0,
+};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
 };
@@ -23,6 +25,7 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_MEDIUM,
     DWRITE_FONT_WEIGHT_REGULAR, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
     DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING,
+    DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER, DWRITE_WORD_WRAPPING_NO_WRAP,
 };
 use windows::Win32::Graphics::Dwm::{
     DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
@@ -36,7 +39,11 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
     DXGI_USAGE_RENDER_TARGET_OUTPUT,
 };
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+};
 use windows::Win32::UI::Controls::MARGINS;
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, SystemParametersInfoW, SPI_GETWORKAREA, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
 };
@@ -71,6 +78,88 @@ pub enum HoverTarget {
     SettingsButton,
 }
 
+pub struct RenderState<'a> {
+    pub monitors: &'a [UiMonitor],
+    pub theme: &'a ThemeColors,
+    pub hover: HoverTarget,
+    pub dragging_idx: Option<usize>,
+    pub focused_idx: Option<usize>,
+    pub linked: bool,
+    pub measuring_ambient: bool,
+    pub refreshing: bool,
+    pub refresh_angle: f32,
+    pub show_auto: bool,
+    pub footer_hint: Option<&'a str>,
+    pub dpi: f32,
+}
+
+pub fn monitor_work_area_and_dpi_at(pt: POINT) -> (RECT, u32) {
+    unsafe {
+        let hmon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+        if !hmon.is_invalid() {
+            let mut mi = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if GetMonitorInfoW(hmon, &mut mi).as_bool() {
+                let mut dpi_x = 96u32;
+                let mut dpi_y = 96u32;
+                let dpi = if GetDpiForMonitor(hmon, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y).is_ok()
+                    && dpi_x > 0
+                {
+                    dpi_x
+                } else {
+                    96
+                };
+                return (mi.rcWork, dpi);
+            }
+        }
+        let mut work_area = RECT::default();
+        let _ = SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some(&mut work_area as *mut _ as *mut core::ffi::c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+        (work_area, 96)
+    }
+}
+
+pub fn create_d3d11_device() -> windows::core::Result<ID3D11Device> {
+    unsafe {
+        let feature_levels = [D3D_FEATURE_LEVEL_11_0];
+        let mut d3d_device: Option<ID3D11Device> = None;
+        if D3D11CreateDevice(
+            None,
+            D3D_DRIVER_TYPE_HARDWARE,
+            None,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            Some(&feature_levels),
+            D3D11_SDK_VERSION,
+            Some(&mut d3d_device),
+            None,
+            None,
+        )
+        .is_err()
+        {
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_WARP,
+                None,
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                Some(&feature_levels),
+                D3D11_SDK_VERSION,
+                Some(&mut d3d_device),
+                None,
+                None,
+            )?;
+        }
+        Ok(d3d_device.ok_or_else(|| {
+            windows::core::Error::from(windows::Win32::Foundation::E_FAIL)
+        })?)
+    }
+}
+
 pub fn compute_flyout_height_dip(monitor_count: usize) -> f32 {
     let cards = monitor_count.max(1) as f32;
     let gaps = (monitor_count.max(1).saturating_sub(1)) as f32;
@@ -78,22 +167,12 @@ pub fn compute_flyout_height_dip(monitor_count: usize) -> f32 {
 }
 
 pub fn compute_flyout_position(width_px: i32, height_px: i32, dpi: u32) -> (i32, i32) {
-    let mut work_area = RECT::default();
-    unsafe {
-        let _ = SystemParametersInfoW(
-            SPI_GETWORKAREA,
-            0,
-            Some(&mut work_area as *mut _ as *mut core::ffi::c_void),
-            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-        );
-    }
-
-    let margin = ((12.0 * dpi as f32) / 96.0).round() as i32;
     let mut cursor = POINT::default();
     let has_cursor = unsafe { GetCursorPos(&mut cursor).is_ok() };
+    let (work_area, _) = monitor_work_area_and_dpi_at(cursor);
 
+    let margin = ((12.0 * dpi as f32) / 96.0).round() as i32;
     let x = if has_cursor && cursor.x >= work_area.left && cursor.x <= work_area.right {
-        // Center horizontally on cursor if near bottom-right, clamped to work area
         (cursor.x - width_px / 2)
             .max(work_area.left + margin)
             .min(work_area.right - width_px - margin)
@@ -275,11 +354,13 @@ pub struct Renderer {
     _dcomp_target: IDCompositionTarget,
     _dcomp_visual: IDCompositionVisual,
     swap_chain: IDXGISwapChain1,
-    d2d_factory: ID2D1Factory1,
     d2d_context: ID2D1DeviceContext,
+    round_cap: ID2D1StrokeStyle,
     _dwrite_factory: IDWriteFactory,
     font_title: IDWriteTextFormat,
     font_small: IDWriteTextFormat,
+    font_button: IDWriteTextFormat,
+    font_status: IDWriteTextFormat,
     font_badge: IDWriteTextFormat,
     width_px: u32,
     height_px: u32,
@@ -288,20 +369,7 @@ pub struct Renderer {
 impl Renderer {
     pub fn new(hwnd: HWND, width_px: u32, height_px: u32, dpi: f32) -> windows::core::Result<Self> {
         unsafe {
-            let mut d3d_device: Option<ID3D11Device> = None;
-            let feature_levels = [D3D_FEATURE_LEVEL_11_0];
-            D3D11CreateDevice(
-                None,
-                D3D_DRIVER_TYPE_HARDWARE,
-                None,
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                Some(&feature_levels),
-                D3D11_SDK_VERSION,
-                Some(&mut d3d_device),
-                None,
-                None,
-            )?;
-            let d3d_device = d3d_device.unwrap();
+            let d3d_device = create_d3d11_device()?;
             let dxgi_device: IDXGIDevice = d3d_device.cast()?;
             let adapter = dxgi_device.GetAdapter()?;
             let dxgi_factory: IDXGIFactory2 = adapter.GetParent()?;
@@ -338,6 +406,17 @@ impl Renderer {
             let d2d_context = d2d_device.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
             d2d_context.SetDpi(dpi, dpi);
 
+            let d2d1_factory: ID2D1Factory = d2d_factory.cast()?;
+            let round_cap = d2d1_factory.CreateStrokeStyle(
+                &D2D1_STROKE_STYLE_PROPERTIES {
+                    startCap: D2D1_CAP_STYLE_ROUND,
+                    endCap: D2D1_CAP_STYLE_ROUND,
+                    dashCap: D2D1_CAP_STYLE_ROUND,
+                    ..Default::default()
+                },
+                None,
+            )?;
+
             let dwrite_factory: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
 
             let font_title = dwrite_factory.CreateTextFormat(
@@ -351,6 +430,17 @@ impl Renderer {
             )?;
             font_title.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
             font_title.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            font_title.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+            if let Ok(ellipsis) = dwrite_factory.CreateEllipsisTrimmingSign(&font_title) {
+                let _ = font_title.SetTrimming(
+                    &DWRITE_TRIMMING {
+                        granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+                        delimiter: 0,
+                        delimiterCount: 0,
+                    },
+                    Some(&ellipsis),
+                );
+            }
 
             let font_small = dwrite_factory.CreateTextFormat(
                 w!("Segoe UI Variable Text"),
@@ -363,6 +453,41 @@ impl Renderer {
             )?;
             font_small.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
             font_small.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+
+            let font_button = dwrite_factory.CreateTextFormat(
+                w!("Segoe UI Variable Text"),
+                None,
+                DWRITE_FONT_WEIGHT_MEDIUM,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                12.0,
+                w!("en-US"),
+            )?;
+            font_button.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+            font_button.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+
+            let font_status = dwrite_factory.CreateTextFormat(
+                w!("Segoe UI Variable Text"),
+                None,
+                DWRITE_FONT_WEIGHT_REGULAR,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                11.5,
+                w!("en-US"),
+            )?;
+            font_status.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+            font_status.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            font_status.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+            if let Ok(ellipsis) = dwrite_factory.CreateEllipsisTrimmingSign(&font_status) {
+                let _ = font_status.SetTrimming(
+                    &DWRITE_TRIMMING {
+                        granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+                        delimiter: 0,
+                        delimiterCount: 0,
+                    },
+                    Some(&ellipsis),
+                );
+            }
 
             let font_badge = dwrite_factory.CreateTextFormat(
                 w!("Segoe UI Variable Text"),
@@ -382,11 +507,13 @@ impl Renderer {
                 _dcomp_target: dcomp_target,
                 _dcomp_visual: dcomp_visual,
                 swap_chain,
-                d2d_factory,
                 d2d_context,
+                round_cap,
                 _dwrite_factory: dwrite_factory,
                 font_title,
                 font_small,
+                font_button,
+                font_status,
                 font_badge,
                 width_px,
                 height_px,
@@ -440,20 +567,11 @@ impl Renderer {
         Ok(())
     }
 
-    pub fn render(
-        &self,
-        monitors: &[UiMonitor],
-        theme: &ThemeColors,
-        hover: HoverTarget,
-        dragging_idx: Option<usize>,
-        linked: bool,
-        auto_brightness: bool,
-        show_auto: bool,
-        dpi: f32,
-    ) -> windows::core::Result<()> {
-        let total_h = compute_flyout_height_dip(monitors.len());
-        let scale = dpi / 96.0;
+    pub fn render(&self, rs: &RenderState) -> windows::core::Result<()> {
+        let total_h = compute_flyout_height_dip(rs.monitors.len());
+        let scale = rs.dpi / 96.0;
         let _w_dip = self.width_px as f32 / scale;
+        let theme = rs.theme;
 
         unsafe {
             let ctx = &self.d2d_context;
@@ -471,20 +589,15 @@ impl Renderer {
             let brush_accent = rt.CreateSolidColorBrush(&theme.accent, None)?;
             let brush_ring = rt.CreateSolidColorBrush(&theme.thumb_ring, None)?;
             let brush_divider = rt.CreateSolidColorBrush(&theme.divider, None)?;
-            let _brush_btn_hover = rt.CreateSolidColorBrush(&theme.button_hover_bg, None)?;
+            let focus_color = D2D1_COLOR_F {
+                r: theme.accent.r,
+                g: theme.accent.g,
+                b: theme.accent.b,
+                a: 0.78,
+            };
+            let brush_focus = rt.CreateSolidColorBrush(&focus_color, None)?;
 
-            let d2d1_factory: ID2D1Factory = self.d2d_factory.cast()?;
-            let round_cap = d2d1_factory.CreateStrokeStyle(
-                &D2D1_STROKE_STYLE_PROPERTIES {
-                    startCap: D2D1_CAP_STYLE_ROUND,
-                    endCap: D2D1_CAP_STYLE_ROUND,
-                    dashCap: D2D1_CAP_STYLE_ROUND,
-                    ..Default::default()
-                },
-                None,
-            )?;
-
-            if monitors.is_empty() {
+            if rs.monitors.is_empty() {
                 let card_rect = D2D1_ROUNDED_RECT {
                     rect: D2D_RECT_F {
                         left: OUTER_PAD,
@@ -498,24 +611,41 @@ impl Renderer {
                 ctx.FillRoundedRectangle(&card_rect, &brush_card);
                 ctx.DrawRoundedRectangle(&card_rect, &brush_card_border, 1.0, None);
 
-                let msg: Vec<u16> = "No DDC/CI or internal displays detected\0"
+                let msg: Vec<u16> = "No controllable displays detected"
                     .encode_utf16()
                     .collect();
                 ctx.DrawText(
-                    &msg[..msg.len() - 1],
+                    &msg,
                     &self.font_title,
                     &D2D_RECT_F {
                         left: OUTER_PAD + 16.0,
                         top: OUTER_PAD + 12.0,
                         right: FLYOUT_WIDTH_DIP - OUTER_PAD - 16.0,
-                        bottom: OUTER_PAD + CARD_HEIGHT - 12.0,
+                        bottom: OUTER_PAD + CARD_HEIGHT - 28.0,
+                    },
+                    &brush_text,
+                    Default::default(),
+                    Default::default(),
+                );
+
+                let sub_msg: Vec<u16> = "Enable DDC/CI in monitor OSD, then click Refresh"
+                    .encode_utf16()
+                    .collect();
+                ctx.DrawText(
+                    &sub_msg,
+                    &self.font_status,
+                    &D2D_RECT_F {
+                        left: OUTER_PAD + 16.0,
+                        top: OUTER_PAD + 44.0,
+                        right: FLYOUT_WIDTH_DIP - OUTER_PAD - 16.0,
+                        bottom: OUTER_PAD + CARD_HEIGHT - 10.0,
                     },
                     &brush_text_dim,
                     Default::default(),
                     Default::default(),
                 );
             } else {
-                for (i, mon) in monitors.iter().enumerate() {
+                for (i, mon) in rs.monitors.iter().enumerate() {
                     let top = OUTER_PAD + (i as f32) * (CARD_HEIGHT + CARD_GAP);
                     let card_rect = D2D1_ROUNDED_RECT {
                         rect: D2D_RECT_F {
@@ -528,12 +658,17 @@ impl Renderer {
                         radiusY: 8.0,
                     };
 
-                    let is_active = hover == HoverTarget::Slider(i) || dragging_idx == Some(i);
+                    let is_active = rs.hover == HoverTarget::Slider(i) || rs.dragging_idx == Some(i);
+                    let is_focused = rs.focused_idx == Some(i);
                     ctx.FillRoundedRectangle(
                         &card_rect,
-                        if is_active { &brush_card_hover } else { &brush_card },
+                        if is_active || is_focused { &brush_card_hover } else { &brush_card },
                     );
-                    ctx.DrawRoundedRectangle(&card_rect, &brush_card_border, 1.0, None);
+                    if is_focused {
+                        ctx.DrawRoundedRectangle(&card_rect, &brush_focus, 1.5, None);
+                    } else {
+                        ctx.DrawRoundedRectangle(&card_rect, &brush_card_border, 1.0, None);
+                    }
 
                     // Monitor badge icon [1]
                     draw_monitor_badge_icon(
@@ -545,7 +680,7 @@ impl Renderer {
                         &self.font_badge,
                     );
 
-                    // Monitor name
+                    // Monitor name (single-line with ellipsis trimming)
                     let name_w: Vec<u16> = mon.name.encode_utf16().collect();
                     ctx.DrawText(
                         &name_w,
@@ -553,7 +688,7 @@ impl Renderer {
                         &D2D_RECT_F {
                             left: SLIDER_LEFT,
                             top: top + 12.0,
-                            right: SLIDER_RIGHT - 36.0,
+                            right: SLIDER_RIGHT - 44.0,
                             bottom: top + 36.0,
                         },
                         &brush_text,
@@ -561,19 +696,19 @@ impl Renderer {
                         Default::default(),
                     );
 
-                    // Brightness percentage on right (shown subtly, brighter when dragging/hovering)
+                    // Brightness percentage on right
                     let pct_str = format!("{}%", mon.brightness);
                     let pct_w: Vec<u16> = pct_str.encode_utf16().collect();
                     ctx.DrawText(
                         &pct_w,
                         &self.font_small,
                         &D2D_RECT_F {
-                            left: SLIDER_RIGHT - 40.0,
+                            left: SLIDER_RIGHT - 46.0,
                             top: top + 12.0,
                             right: SLIDER_RIGHT,
                             bottom: top + 36.0,
                         },
-                        if is_active { &brush_text } else { &brush_text_dim },
+                        if is_active || is_focused { &brush_text } else { &brush_text_dim },
                         Default::default(),
                         Default::default(),
                     );
@@ -592,7 +727,7 @@ impl Renderer {
                         D2D_POINT_2F { x: SLIDER_RIGHT, y: slider_y },
                         &brush_track,
                         4.0,
-                        &round_cap,
+                        &self.round_cap,
                     );
                     // Filled track
                     ctx.DrawLine(
@@ -600,18 +735,18 @@ impl Renderer {
                         D2D_POINT_2F { x: thumb_x, y: slider_y },
                         &brush_accent,
                         4.0,
-                        &round_cap,
+                        &self.round_cap,
                     );
 
                     // Thumb outer ring
-                    let outer_r = if dragging_idx == Some(i) || hover == HoverTarget::Slider(i) {
+                    let outer_r = if rs.dragging_idx == Some(i) || rs.hover == HoverTarget::Slider(i) || is_focused {
                         11.0
                     } else {
                         10.0
                     };
-                    let inner_r = if dragging_idx == Some(i) {
+                    let inner_r = if rs.dragging_idx == Some(i) {
                         4.5
-                    } else if hover == HoverTarget::Slider(i) {
+                    } else if rs.hover == HoverTarget::Slider(i) || is_focused {
                         6.5
                     } else {
                         5.5
@@ -657,10 +792,38 @@ impl Renderer {
             );
 
             // Toolbar buttons
-            for (target, r) in button_rects(total_h, show_auto) {
-                let is_hovered = hover == target;
-                let is_active_toggle = (target == HoverTarget::LinkButton && linked)
-                    || (target == HoverTarget::AutoButton && auto_brightness);
+            let buttons = button_rects(total_h, rs.show_auto);
+            let hint_left = if rs.show_auto { OUTER_PAD + 64.0 } else { OUTER_PAD + 4.0 };
+            let hint_right = buttons
+                .iter()
+                .find(|(t, _)| *t == HoverTarget::LinkButton)
+                .map(|(_, r)| r.left - 8.0)
+                .unwrap_or(FLYOUT_WIDTH_DIP - OUTER_PAD - 120.0);
+
+            if let Some(hint) = rs.footer_hint {
+                if hint_right > hint_left + 20.0 {
+                    let hint_w: Vec<u16> = hint.encode_utf16().collect();
+                    ctx.DrawText(
+                        &hint_w,
+                        &self.font_status,
+                        &D2D_RECT_F {
+                            left: hint_left,
+                            top: div_y,
+                            right: hint_right,
+                            bottom: total_h,
+                        },
+                        &brush_text_dim,
+                        Default::default(),
+                        Default::default(),
+                    );
+                }
+            }
+
+            for (target, r) in buttons {
+                let is_hovered = rs.hover == target;
+                let is_active_toggle = (target == HoverTarget::LinkButton && rs.linked)
+                    || (target == HoverTarget::AutoButton && rs.measuring_ambient)
+                    || (target == HoverTarget::RefreshButton && rs.refreshing);
 
                 if is_hovered || is_active_toggle {
                     let bg_color = if is_active_toggle && !is_hovered {
@@ -697,20 +860,21 @@ impl Renderer {
 
                 match target {
                     HoverTarget::AutoButton => {
-                        let label: Vec<u16> = "Auto".encode_utf16().collect();
-                        self.font_small.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+                        let text = if rs.measuring_ambient { "Auto..." } else { "Auto" };
+                        let label: Vec<u16> = text.encode_utf16().collect();
                         ctx.DrawText(
                             &label,
-                            &self.font_small,
+                            &self.font_button,
                             &r,
                             icon_brush,
                             Default::default(),
                             Default::default(),
                         );
-                        self.font_small.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
                     }
-                    HoverTarget::LinkButton => draw_link_icon(ctx, cx, cy, icon_brush, &round_cap),
-                    HoverTarget::RefreshButton => draw_refresh_icon(ctx, cx, cy, icon_brush, &round_cap),
+                    HoverTarget::LinkButton => draw_link_icon(ctx, cx, cy, icon_brush, &self.round_cap),
+                    HoverTarget::RefreshButton => {
+                        draw_refresh_icon(ctx, cx, cy, rs.refresh_angle, icon_brush, &self.round_cap)
+                    }
                     HoverTarget::SettingsButton => draw_settings_icon(ctx, cx, cy, icon_brush),
                     _ => {}
                 }
@@ -868,13 +1032,14 @@ unsafe fn draw_refresh_icon(
     ctx: &ID2D1DeviceContext,
     cx: f32,
     cy: f32,
+    angle_rad: f32,
     brush: &ID2D1SolidColorBrush,
-    cap: &windows::Win32::Graphics::Direct2D::ID2D1StrokeStyle,
+    cap: &ID2D1StrokeStyle,
 ) {
-    // Draw a ~290-degree arc via short segments + arrowhead
+    // Draw a ~290-degree arc via short segments + rotated arrowhead
     let r = 6.5;
     let steps = 18;
-    let start_angle = -0.35_f32;
+    let start_angle = -0.35_f32 + angle_rad;
     let end_angle = start_angle + 5.1;
     let mut prev = D2D_POINT_2F {
         x: cx + r * start_angle.cos(),
@@ -889,31 +1054,17 @@ unsafe fn draw_refresh_icon(
         ctx.DrawLine(prev, cur, brush, 1.4, cap);
         prev = cur;
     }
-    // Arrowhead at start_angle
     let tip = D2D_POINT_2F {
         x: cx + r * start_angle.cos(),
         y: cy + r * start_angle.sin(),
     };
-    ctx.DrawLine(
-        tip,
-        D2D_POINT_2F {
-            x: tip.x - 3.8,
-            y: tip.y - 0.5,
-        },
-        brush,
-        1.4,
-        cap,
-    );
-    ctx.DrawLine(
-        tip,
-        D2D_POINT_2F {
-            x: tip.x + 0.5,
-            y: tip.y - 3.8,
-        },
-        brush,
-        1.4,
-        cap,
-    );
+    let (rot_c, rot_s) = (angle_rad.cos(), angle_rad.sin());
+    let rot_offset = |dx: f32, dy: f32| D2D_POINT_2F {
+        x: tip.x + dx * rot_c - dy * rot_s,
+        y: tip.y + dx * rot_s + dy * rot_c,
+    };
+    ctx.DrawLine(tip, rot_offset(-3.8, -0.5), brush, 1.4, cap);
+    ctx.DrawLine(tip, rot_offset(0.5, -3.8), brush, 1.4, cap);
 }
 
 unsafe fn draw_settings_icon(

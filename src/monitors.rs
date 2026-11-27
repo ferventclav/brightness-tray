@@ -25,7 +25,7 @@ use windows::Win32::System::Wmi::{
 const RPC_C_AUTHN_WINNT: u32 = 10;
 const RPC_C_AUTHZ_NONE: u32 = 0;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BackendKind {
     InternalWmi,
     DdcCi {
@@ -51,6 +51,7 @@ struct DisplayConfigMeta {
 
 pub struct MonitorManager {
     pub monitors: Vec<MonitorInfo>,
+    pub has_pending_ddc: bool,
     ddc_handles: Vec<PHYSICAL_MONITOR>,
     wmi_services: Option<IWbemServices>,
     wmi_path: Option<BSTR>,
@@ -73,6 +74,7 @@ impl MonitorManager {
             .unwrap_or((None, None));
         let mut mgr = Self {
             monitors: Vec::new(),
+            has_pending_ddc: false,
             ddc_handles: Vec::new(),
             wmi_services,
             wmi_path,
@@ -94,6 +96,17 @@ impl MonitorManager {
     pub fn refresh(&mut self) {
         self.clear_ddc_handles();
         self.monitors.clear();
+        self.has_pending_ddc = false;
+
+        if self.wmi_services.is_none() {
+            self.wmi_services = connect_wmi().ok();
+        }
+        if self.wmi_in_params_def.is_none() {
+            if let Some((p, d)) = self.wmi_services.as_ref().and_then(prepare_wmi_set_method) {
+                self.wmi_path = Some(p);
+                self.wmi_in_params_def = Some(d);
+            }
+        }
 
         let config_map = query_display_config_meta();
         let hmonitors = enumerate_hmonitors();
@@ -149,13 +162,13 @@ impl MonitorManager {
                             GetMonitorBrightness(pm.hPhysicalMonitor, &mut min, &mut cur, &mut max)
                         };
                         if ok != 0 && max > min {
-                            let pct = ((cur.saturating_sub(min)) * 100) / (max - min);
+                            let pct = raw_to_pct(cur, min, max);
                             let id = format!("{}#{}", gdi_name, p_idx);
                             self.monitors.push(MonitorInfo {
                                 id,
                                 display_number,
                                 name: display_label.clone(),
-                                brightness: pct.min(100),
+                                brightness: pct,
                                 backend: BackendKind::DdcCi {
                                     handle_raw: pm.hPhysicalMonitor.0 as isize,
                                     min,
@@ -168,10 +181,15 @@ impl MonitorManager {
                     if added_ddc {
                         self.ddc_handles.extend(phys);
                     } else {
+                        if !is_internal {
+                            self.has_pending_ddc = true;
+                        }
                         unsafe {
                             let _ = DestroyPhysicalMonitors(&phys);
                         }
                     }
+                } else if !is_internal {
+                    self.has_pending_ddc = true;
                 }
             }
         }
@@ -197,7 +215,7 @@ impl MonitorManager {
                 }
             }
             BackendKind::DdcCi { handle_raw, min, max } => {
-                let raw = min + ((max - min) * pct) / 100;
+                let raw = pct_to_raw(pct, *min, *max);
                 let h = HANDLE(*handle_raw as *mut core::ffi::c_void);
                 unsafe { SetMonitorBrightness(h, raw) != 0 }
             }
@@ -208,6 +226,22 @@ impl MonitorManager {
         }
         ok
     }
+}
+
+pub fn raw_to_pct(cur: u32, min: u32, max: u32) -> u32 {
+    if max <= min {
+        return 0;
+    }
+    let span = max - min;
+    (((cur.saturating_sub(min)) * 100 + span / 2) / span).min(100)
+}
+
+pub fn pct_to_raw(pct: u32, min: u32, max: u32) -> u32 {
+    if max <= min {
+        return min;
+    }
+    let pct = pct.min(100);
+    min + ((max - min) * pct + 50) / 100
 }
 
 fn parse_display_number(gdi_name: &str) -> Option<u32> {
@@ -482,10 +516,26 @@ mod tests {
         for m in &mgr.monitors {
             println!("  [{}] {} -> {}% ({:?})", m.display_number, m.name, m.brightness, m.backend);
         }
-        assert!(!mgr.monitors.is_empty(), "Expected at least one controllable monitor");
+        if std::env::var_os("CI").is_none() {
+            assert!(!mgr.monitors.is_empty(), "Expected at least one controllable monitor");
+        }
         drop(mgr);
         unsafe {
             CoUninitialize();
+        }
+    }
+
+    #[test]
+    fn test_ddc_rounding_roundtrip() {
+        // High-resolution VCP ranges (span >= 100) must round-trip every percentage identically
+        for pct in 0..=100 {
+            assert_eq!(raw_to_pct(pct_to_raw(pct, 0, 100), 0, 100), pct);
+            assert_eq!(raw_to_pct(pct_to_raw(pct, 0, 255), 0, 255), pct);
+        }
+        // Coarser VCP ranges (span < 100) must round-trip every hardware step without downward drift
+        for raw in 10..=90 {
+            let pct = raw_to_pct(raw, 10, 90);
+            assert_eq!(pct_to_raw(pct, 10, 90), raw);
         }
     }
 

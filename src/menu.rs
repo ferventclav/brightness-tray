@@ -1,5 +1,5 @@
 use windows::core::{w, Interface};
-use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_RECT_F,
 };
@@ -9,10 +9,7 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_BITMAP_PROPERTIES1, D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED,
     D2D1_ROUNDED_RECT,
 };
-use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
-use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
-};
+use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 use windows::Win32::Graphics::DirectComposition::{
     DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
 };
@@ -35,15 +32,14 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TR
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, LoadCursorW,
     PostMessageW, RegisterClassW, SetForegroundWindow, SetWindowPos, ShowWindow,
-    SystemParametersInfoW, TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
-    GWLP_USERDATA, HWND_TOPMOST, IDC_ARROW, IDC_HAND, MSG, SPI_GETWORKAREA, SWP_SHOWWINDOW,
-    SW_HIDE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WA_INACTIVE, WM_ACTIVATE, WM_CREATE,
+    TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HWND_TOPMOST,
+    IDC_ARROW, IDC_HAND, MSG, SWP_SHOWWINDOW, SW_HIDE, WA_INACTIVE, WM_ACTIVATE, WM_CREATE,
     WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_SETCURSOR, WNDCLASSW,
     WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::theme::ThemeColors;
-use crate::ui::apply_win11_backdrop;
+use crate::ui::{apply_win11_backdrop, create_d3d11_device, monitor_work_area_and_dpi_at};
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const MENU_WIDTH_DIP: f32 = 256.0;
@@ -70,6 +66,7 @@ struct MenuState {
     selected_id: Option<usize>,
     closed: bool,
     tracking_mouse: bool,
+    _d3d_device: ID3D11Device,
     d3d_swap: IDXGISwapChain1,
     _dcomp_device: IDCompositionDevice,
     _dcomp_target: IDCompositionTarget,
@@ -312,7 +309,10 @@ pub fn show_fluent_menu(
                 })
                 .sum::<f32>();
 
-        let dpi = {
+        let (work_area, mon_dpi) = monitor_work_area_and_dpi_at(anchor);
+        let dpi = if mon_dpi != 0 {
+            mon_dpi
+        } else {
             let d = GetDpiForWindow(parent);
             if d == 0 { 96 } else { d }
         };
@@ -320,13 +320,6 @@ pub fn show_fluent_menu(
         let w_px = (MENU_WIDTH_DIP * scale).round() as i32;
         let h_px = (total_h_dip * scale).round() as i32;
 
-        let mut work_area = RECT::default();
-        let _ = SystemParametersInfoW(
-            SPI_GETWORKAREA,
-            0,
-            Some(&mut work_area as *mut _ as *mut core::ffi::c_void),
-            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-        );
         let margin = (8.0 * scale).round() as i32;
         let x = (anchor.x - w_px / 2)
             .max(work_area.left + margin)
@@ -353,26 +346,10 @@ pub fn show_fluent_menu(
 
         apply_win11_backdrop(hwnd, theme.is_dark);
 
-        // Init D3D11 + DComp + D2D1
-        let mut d3d_device = None;
-        let feature_levels = [D3D_FEATURE_LEVEL_11_0];
-        if D3D11CreateDevice(
-            None,
-            D3D_DRIVER_TYPE_HARDWARE,
-            None,
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-            Some(&feature_levels),
-            D3D11_SDK_VERSION,
-            Some(&mut d3d_device),
-            None,
-            None,
-        )
-        .is_err()
-        {
+        let Ok(d3d_device) = create_d3d11_device() else {
             let _ = DestroyWindow(hwnd);
             return None;
-        }
-        let d3d_device = d3d_device?;
+        };
         let dxgi_device: IDXGIDevice = d3d_device.cast().ok()?;
         let adapter = dxgi_device.GetAdapter().ok()?;
         let dxgi_factory: IDXGIFactory2 = adapter.GetParent().ok()?;
@@ -479,6 +456,7 @@ pub fn show_fluent_menu(
             selected_id: None,
             closed: false,
             tracking_mouse: false,
+            _d3d_device: d3d_device,
             d3d_swap,
             _dcomp_device: dcomp_device,
             _dcomp_target: dcomp_target,
@@ -547,9 +525,37 @@ unsafe extern "system" fn menu_wnd_proc(
             LRESULT(0)
         }
         WM_KEYDOWN => {
-            if wparam.0 == 0x1B {
-                // VK_ESCAPE
-                state.closed = true;
+            match wparam.0 {
+                0x1B => {
+                    // VK_ESCAPE
+                    state.closed = true;
+                }
+                0x26 => {
+                    // VK_UP
+                    let next = move_menu_selection(&state.entries, state.hover_idx, -1);
+                    if next != state.hover_idx {
+                        state.hover_idx = next;
+                        state.render();
+                    }
+                }
+                0x28 => {
+                    // VK_DOWN
+                    let next = move_menu_selection(&state.entries, state.hover_idx, 1);
+                    if next != state.hover_idx {
+                        state.hover_idx = next;
+                        state.render();
+                    }
+                }
+                0x0D | 0x20 => {
+                    // VK_RETURN | VK_SPACE
+                    if let Some(idx) = state.hover_idx {
+                        if let Some(MenuEntry::Item { id, .. }) = state.entries.get(idx) {
+                            state.selected_id = Some(*id);
+                            state.closed = true;
+                        }
+                    }
+                }
+                _ => {}
             }
             LRESULT(0)
         }
@@ -601,5 +607,48 @@ unsafe extern "system" fn menu_wnd_proc(
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+fn move_menu_selection(entries: &[MenuEntry], current: Option<usize>, dir: isize) -> Option<usize> {
+    let item_indices: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| matches!(e, MenuEntry::Item { .. }).then_some(i))
+        .collect();
+    if item_indices.is_empty() {
+        return None;
+    }
+    match current.and_then(|c| item_indices.iter().position(|&idx| idx == c)) {
+        Some(pos) => {
+            let len = item_indices.len() as isize;
+            let next_pos = (pos as isize + dir).rem_euclid(len) as usize;
+            Some(item_indices[next_pos])
+        }
+        None => {
+            if dir >= 0 {
+                Some(item_indices[0])
+            } else {
+                Some(*item_indices.last().unwrap())
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_menu_keyboard_navigation_skips_separators() {
+        let entries = vec![
+            MenuEntry::Item { id: 1, label: "One".into(), glyph: 0, checked: None },
+            MenuEntry::Separator,
+            MenuEntry::Item { id: 2, label: "Two".into(), glyph: 0, checked: None },
+        ];
+        assert_eq!(move_menu_selection(&entries, None, 1), Some(0));
+        assert_eq!(move_menu_selection(&entries, Some(0), 1), Some(2));
+        assert_eq!(move_menu_selection(&entries, Some(2), 1), Some(0));
+        assert_eq!(move_menu_selection(&entries, Some(0), -1), Some(2));
     }
 }

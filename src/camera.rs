@@ -4,23 +4,62 @@ use std::sync::Arc;
 use windows::core::{w, Interface};
 use windows::Win32::Media::DirectShow::{CameraControl_Exposure, IAMCameraControl};
 use windows::Win32::Media::MediaFoundation::{
-    IMFMediaBuffer, IMFMediaSource, IMFSample, IMFSourceReader, MFCreateAttributes,
+    IMFActivate, IMFMediaBuffer, IMFMediaSource, IMFSample, IMFSourceReader, MFCreateAttributes,
     MFCreateMediaType, MFCreateSourceReaderFromMediaSource, MFEnumDeviceSources, MFShutdown,
-    MFStartup, MFVideoFormat_RGB32, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
-    MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE,
-    MF_MT_SUBTYPE, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
-    MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_VERSION, MFMediaType_Video, MFSTARTUP_NOSOCKET,
+    MFStartup, MFVideoFormat_RGB32, MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME,
+    MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
+    MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
+    MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_VERSION,
+    MFMediaType_Video, MFSTARTUP_NOSOCKET,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Registry::{
     RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER,
-    KEY_READ, REG_QWORD,
+    KEY_READ, REG_QWORD, REG_SZ,
 };
+
+use crate::ambient::AmbientResult;
 
 /// Checks Windows CapabilityAccessManager ConsentStore to see if any app currently
 /// has the webcam open (`LastUsedTimeStop == 0`). If so, we must not touch the camera.
 fn is_camera_in_use_by_other_app() -> bool {
     unsafe { check_consent_subkey(w!(r"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\webcam")) }
+}
+
+/// Checks if Windows camera privacy access is explicitly denied for desktop apps.
+fn is_camera_access_denied() -> bool {
+    unsafe {
+        if check_deny_value(w!(r"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\webcam")) {
+            return true;
+        }
+        check_deny_value(w!(r"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\webcam\NonPackaged"))
+    }
+}
+
+unsafe fn check_deny_value(path: windows::core::PCWSTR) -> bool {
+    let mut hkey = HKEY::default();
+    if RegOpenKeyExW(HKEY_CURRENT_USER, path, 0, KEY_READ, &mut hkey).is_err() {
+        return false;
+    }
+    let mut buf = [0u16; 32];
+    let mut size = (buf.len() * std::mem::size_of::<u16>()) as u32;
+    let mut reg_type = REG_SZ;
+    let denied = RegQueryValueExW(
+        hkey,
+        w!("Value"),
+        None,
+        Some(&mut reg_type),
+        Some(buf.as_mut_ptr() as *mut u8),
+        Some(&mut size),
+    )
+    .is_ok()
+        && {
+            let n = (size as usize / 2).min(buf.len());
+            let s = String::from_utf16_lossy(&buf[..n]);
+            s.trim_end_matches('\0').eq_ignore_ascii_case("Deny")
+        };
+    let _ = RegCloseKey(hkey);
+    denied
 }
 
 unsafe fn check_consent_subkey(path: windows::core::PCWSTR) -> bool {
@@ -98,21 +137,54 @@ unsafe fn check_hkey_recursive(hkey: HKEY, depth: u32) -> bool {
     false
 }
 
-/// Measures room ambient light using the default webcam in read-only mode
+/// Measures room ambient light using the default physical webcam in read-only mode
 /// (never taking exclusive control or changing camera settings).
-/// Immediately skips if another app is already using the camera, and shuts down
-/// within ~1.5s max.
-pub fn measure_room_brightness() -> Option<u32> {
+/// Immediately skips if another app is already using the camera or camera access is denied,
+/// and shuts down within ~2.8s max.
+pub fn measure_room_brightness() -> AmbientResult {
+    if is_camera_access_denied() {
+        return AmbientResult::CameraDenied;
+    }
     if is_camera_in_use_by_other_app() {
-        return None;
+        return AmbientResult::CameraInUse;
     }
     unsafe {
         if MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET).is_err() {
-            return None;
+            return AmbientResult::Unavailable;
         }
         let result = measure_inner();
         let _ = MFShutdown();
-        result
+        match result {
+            Some(b) => AmbientResult::Brightness(b),
+            None => AmbientResult::Unavailable,
+        }
+    }
+}
+
+pub fn is_virtual_camera_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("virtual")
+        || lower.contains("obs ")
+        || lower.contains("obs-")
+        || lower.contains("nvidia broadcast")
+        || lower.contains("snap camera")
+        || lower.contains("droidcam")
+        || lower.contains("epoccam")
+        || lower.contains("iriun")
+        || lower.contains("manycam")
+}
+
+pub unsafe fn activate_friendly_name(act: &IMFActivate) -> String {
+    let mut buf = [0u16; 256];
+    let mut len = 0u32;
+    if act
+        .GetString(&MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, &mut buf, Some(&mut len))
+        .is_ok()
+    {
+        let end = buf.iter().position(|&c| c == 0).unwrap_or(len as usize).min(buf.len());
+        String::from_utf16_lossy(&buf[..end])
+    } else {
+        String::new()
     }
 }
 
@@ -135,7 +207,15 @@ unsafe fn measure_inner() -> Option<u32> {
     }
 
     let devices = std::slice::from_raw_parts_mut(devices_ptr, count as usize);
-    let source: Option<IMFMediaSource> = devices[0]
+    let preferred_idx = devices
+        .iter()
+        .position(|opt| {
+            opt.as_ref()
+                .map(|act| !is_virtual_camera_name(&activate_friendly_name(act)))
+                .unwrap_or(false)
+        })
+        .unwrap_or(0);
+    let source: Option<IMFMediaSource> = devices[preferred_idx]
         .as_ref()
         .and_then(|act| act.ActivateObject().ok());
 
@@ -357,6 +437,15 @@ mod tests {
     #[test]
     fn test_consent_store_check() {
         let _ = is_camera_in_use_by_other_app();
+        let _ = is_camera_access_denied();
+    }
+
+    #[test]
+    fn test_virtual_camera_filter() {
+        assert!(is_virtual_camera_name("OBS Virtual Camera"));
+        assert!(is_virtual_camera_name("NVIDIA Broadcast"));
+        assert!(!is_virtual_camera_name("Integrated Webcam"));
+        assert!(!is_virtual_camera_name("Logitech BRIO"));
     }
 
     #[test]
